@@ -1,0 +1,129 @@
+# docker-compose.airflow.yml
+# Standalone Airflow for external/production deployment.
+# Connects to the reconciliation app via the shared Docker network.
+#
+# Usage:
+#   1. Start the main app first:   docker compose up -d
+#   2. Start Airflow:              docker compose -f docker-compose.airflow.yml up -d
+#   3. Set AIRFLOW_USE_EXTERNAL=true in .env, then: docker compose restart backend
+#
+# The Airflow services join the main app's network to communicate
+# with the backend via http://backend:8000.
+
+x-airflow-common: &airflow-common
+  image: apache/airflow:2.8.1-python3.11
+  environment: &airflow-env
+    AIRFLOW__CORE__EXECUTOR: CeleryExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://reco_airflow_ext:${AIRFLOW_EXT_DB_PASSWORD:-ext-airflow-change-me}@airflow-ext-db:5432/reco_airflow_ext_db
+    AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql://reco_airflow_ext:${AIRFLOW_EXT_DB_PASSWORD:-ext-airflow-change-me}@airflow-ext-db:5432/reco_airflow_ext_db
+    AIRFLOW__CELERY__BROKER_URL: redis://:@airflow-ext-redis:6379/0
+    AIRFLOW__CORE__FERNET_KEY: ${AIRFLOW_FERNET_KEY:-46BKJoQYlPPOexq0OhDZnIlNepKFf87WFwLbfzqDDho=}
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
+    AIRFLOW__API__AUTH_BACKENDS: airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session
+    AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_WEBSERVER_SECRET:-airflow-secret-change-me}
+    # Backend communication — uses internal Docker network hostname
+    RECO_BACKEND_URL: http://backend:8000
+    RECO_BACKEND_INTERNAL_TOKEN: ${RECO_BACKEND_INTERNAL_TOKEN:-change-me-internal-token}
+  volumes:
+    - ./shared/dags:/opt/airflow/dags
+    - ./shared/airflow_logs:/opt/airflow/logs
+    - ./shared/airflow_plugins:/opt/airflow/plugins
+    - ./shared/inbox:/opt/airflow/inbox
+    - ./shared/inbox_processed:/opt/airflow/inbox_processed
+    - ./shared/inbox_error:/opt/airflow/inbox_error
+  user: "${AIRFLOW_UID:-50000}:0"
+  depends_on: &airflow-deps
+    airflow-ext-db:
+      condition: service_healthy
+    airflow-ext-redis:
+      condition: service_healthy
+  networks:
+    - reco-app-network
+
+services:
+  airflow-ext-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: reco_airflow_ext
+      POSTGRES_PASSWORD: ${AIRFLOW_EXT_DB_PASSWORD:-ext-airflow-change-me}
+      POSTGRES_DB: reco_airflow_ext_db
+    volumes:
+      - reco_airflow_ext_db_data:/var/lib/postgresql/data
+    networks:
+      - reco-app-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U reco_airflow_ext -d reco_airflow_ext_db"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  airflow-ext-redis:
+    image: redis:7-alpine
+    expose:
+      - "6379"
+    networks:
+      - reco-app-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  airflow-ext-init:
+    <<: *airflow-common
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db migrate &&
+        airflow users create \
+          --username "${AIRFLOW_API_USER:-airflow}" \
+          --password "${AIRFLOW_API_PASSWORD:-airflow}" \
+          --firstname Air --lastname Flow \
+          --role Admin --email airflow@local || true
+    restart: "no"
+
+  airflow-ext-webserver:
+    <<: *airflow-common
+    command: webserver
+    ports:
+      - "${AIRFLOW_EXT_PORT:-8081}:8080"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+    restart: unless-stopped
+    depends_on:
+      <<: *airflow-deps
+      airflow-ext-init:
+        condition: service_completed_successfully
+
+  airflow-ext-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    restart: unless-stopped
+    depends_on:
+      <<: *airflow-deps
+      airflow-ext-init:
+        condition: service_completed_successfully
+
+  airflow-ext-worker:
+    <<: *airflow-common
+    command: celery worker
+    restart: unless-stopped
+    depends_on:
+      <<: *airflow-deps
+      airflow-ext-init:
+        condition: service_completed_successfully
+
+networks:
+  reco-app-network:
+    # Join the main app's Docker network
+    external: true
+    name: reconciliation_orchestro-network
+
+volumes:
+  reco_airflow_ext_db_data:

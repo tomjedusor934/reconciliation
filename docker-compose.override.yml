@@ -1,0 +1,14 @@
+# Local-dev override (not for production).
+# The base compose binds /POST_HOME/dataStaging/* (server paths that don't
+# exist on a workstation); this override remaps them to ./tmp/staging so the
+# stack can boot locally. docker compose merges this file automatically.
+services:
+  backend:
+    volumes:
+      - ./backend:/app
+      - ./shared/inbox:/shared/inbox
+      - ./shared/inbox_processed:/shared/inbox_processed
+      - ./shared/inbox_error:/shared/inbox_error
+      - ./tmp/staging/in:/data/staging/in
+      - ./tmp/staging/out/reconciliation:/data/staging/out/reconciliation
+      - ./tmp/staging/out/reconciliation_errors:/data/staging/out/reconciliation_errors

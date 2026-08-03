@@ -1,0 +1,13 @@
+shared/dags/archive_matched.py
+shared/dags/dag_factory.py
+shared/dags/ingest_atm.py
+shared/dags/ingest_finacle.py
+shared/dags/ingest_float_ip.py
+shared/dags/ingest_ip.py
+shared/dags/ingest_other_payments.py
+shared/dags/ingest_webripost.py
+shared/dags/mt940_extract.py
+shared/dags/reco_common.py
+shared/dags/reco_datamart.py
+shared/dags/reconcile_daily.py
+shared/dags/thaler_ingest.py

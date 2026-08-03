@@ -1,0 +1,5 @@
+# Ignorer tout sauf les fichiers .py
+.*(?<!\.py)$
+__pycache__/
+*.pyc
+.pytest_cache/
