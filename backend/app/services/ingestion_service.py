@@ -422,6 +422,7 @@ class IngestionService:
             "transaction_particulars": e.transaction_particulars,
             "ref_no": e.ref_no,
             "remarks_1": e.remarks_1,
+            "transaction_id": e.transaction_id,
             "payload_raw": e.payload_raw,
             # Identity must exclude reco_id when it is resolved AFTER ingestion
             # (finacle, or file sources looking reco_id up against finacle) so it

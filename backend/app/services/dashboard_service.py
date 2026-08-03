@@ -21,8 +21,6 @@ from app.schemas.reconciliation import (
     IngestionCalendarResponse,
     IngestionRunSummary,
     ReconciliationRunResponse,
-    TransversalGroup,
-    ReconciliationEntryResponse,
 )
 
 
@@ -120,26 +118,6 @@ class DashboardService:
         return IngestionCalendarResponse(
             flow_id=flow_id, year=year, month=month, days=days
         )
-
-    def transversal(self, db: Session, *, reco_id: str) -> List[TransversalGroup]:
-        entries = reconciliation_entry_repository.list_by_reco_id(db, reco_id=reco_id)
-        # Group by currency (a single reco_id can in theory span flows but rarely currencies)
-        groups: dict[str, list] = defaultdict(list)
-        for e in entries:
-            groups[e.currency].append(e)
-        out: List[TransversalGroup] = []
-        for cur, items in groups.items():
-            total = sum((e.amount for e in items), Decimal("0"))
-            out.append(
-                TransversalGroup(
-                    reco_id=reco_id,
-                    currency=cur,
-                    entries=[ReconciliationEntryResponse.model_validate(e) for e in items],
-                    sum=total,
-                    is_balanced=(total == Decimal("0")),
-                )
-            )
-        return out
 
 
 dashboard_service = DashboardService()

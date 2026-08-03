@@ -3,7 +3,7 @@
 Each class groups the business filter parameters for an endpoint so that
 the endpoint signature only exposes skip, limit, db and the auth dependency.
 """
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal
 from typing import List, Optional
 
@@ -62,6 +62,17 @@ class EntryListFilter:
             default=None,
             description="Keep rows carrying at least one of these payment statuses ('?' = unknown)",
         ),
+        # Naive datetimes (YYYY-MM-DDTHH:MM) — the column is TIMESTAMP WITHOUT
+        # TIME ZONE and the UI sends wall clock, so the hour filtered on is the
+        # hour displayed. Both bounds inclusive.
+        payment_timestamp_from: Optional[datetime] = Query(
+            default=None,
+            description="Keep rows with at least one payment accepted at or after this datetime",
+        ),
+        payment_timestamp_to: Optional[datetime] = Query(
+            default=None,
+            description="Keep rows with at least one payment accepted at or before this datetime",
+        ),
         account: Optional[str] = Query(default=None, description="Filter by account"),
         date_from: Optional[date] = Query(default=None, description="Start date (YYYY-MM-DD)"),
         date_to: Optional[date] = Query(default=None, description="End date (YYYY-MM-DD)"),
@@ -73,6 +84,8 @@ class EntryListFilter:
         self.amount_min = amount_min
         self.amount_max = amount_max
         self.payment_statuses = payment_statuses
+        self.payment_timestamp_from = payment_timestamp_from
+        self.payment_timestamp_to = payment_timestamp_to
         self.account = account
         self.date_from = date_from
         self.date_to = date_to
@@ -125,12 +138,22 @@ class IngestionCalendarFilter:
         self.month = month
 
 
-class TransversalFilter:
+class DeepSearchFilter:
     def __init__(
         self,
-        reco_id: str = Query(..., min_length=1, description="Reco ID to search"),
+        q: str = Query(
+            ..., min_length=1,
+            description="Any identifier: payment number, lot uuid, reco ID, "
+                        "TransactionID, ref_no, remarks_1, lot key",
+        ),
+        broad: bool = Query(
+            default=False,
+            description="Fall back to a partial (ILIKE) match when the exact "
+                        "lookup finds nothing — sequential scan, opt-in only",
+        ),
     ):
-        self.reco_id = reco_id
+        self.q = q
+        self.broad = broad
 
 
 # ── Movement lots (Finacle Batch Booking True) ──────────────────────

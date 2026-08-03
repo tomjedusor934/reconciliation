@@ -21,6 +21,12 @@ API_PREFIX = os.environ.get("RECO_BACKEND_API_PREFIX", "/api/v1")
 # endpoint in the threadpool). That is what deadlocked on 2026-07-16.
 RECONCILE_TIMEOUT = int(os.environ.get("RECO_RECONCILE_TIMEOUT", "3600"))
 
+# One connection reused across the run. An ingestion pushes hundreds of batches
+# back to back (entries, then lot members); a bare requests.request() opens a
+# fresh TCP connection for each one. Calls are sequential, so a plain Session
+# (default pool) is enough.
+_SESSION = requests.Session()
+
 
 def _get_backend_url() -> str:
     val = os.environ.get("RECO_BACKEND_URL")
@@ -54,7 +60,7 @@ def call_backend(
 ) -> Dict[str, Any]:
     url = f"{_get_backend_url()}{API_PREFIX}{path}"
     headers = {"X-Internal-Token": _get_internal_token()}
-    resp = requests.request(
+    resp = _SESSION.request(
         method, url, json=json, params=params, headers=headers, timeout=timeout
     )
     resp.raise_for_status()

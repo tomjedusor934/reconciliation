@@ -27,6 +27,10 @@ class PaymentStatusRowIn(BaseModel):
     status: Optional[str] = Field(default=None, max_length=32)
     # the payment's amount (std.Payment); None when the DAG could not resolve it.
     amount: Optional[Decimal] = None
+    # the payment's creation timestamp (std.Payment.CreatedOn); same
+    # nullability. Naive by contract — the DAG strips any offset so the stored
+    # wall clock is the one the operational hour filter compares against.
+    payment_timestamp: Optional[datetime] = None
 
 
 class PaymentStatusBatchIn(BaseModel):

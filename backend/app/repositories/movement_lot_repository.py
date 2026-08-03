@@ -40,6 +40,13 @@ logger = logging.getLogger(__name__)
 # entry_payment_status.amount over the PDNG rows yields the real pending total.
 PENDING_PAYMENT_STATUS = "PDNG"
 
+# Key rows per INSERT statement. psycopg2 interpolates parameters client-side, so
+# a statement's size is bounded by nothing but the row count — and one SP bulk
+# member can carry thousands of keys (see reco_datamart_bb._single_lot_report).
+# At 10 000 members per batch an unbounded statement would be tens of MB of SQL
+# built in Python and parsed in one shot.
+KEY_INSERT_CHUNK = 10000
+
 
 class MovementLotRepository:
     # ------------------------------------------------------------------
@@ -188,19 +195,22 @@ class MovementLotRepository:
 
     def insert_keys(self, db: Session, rows: Sequence[dict]) -> int:
         """Keys only ever accrue (late std.Payment data adds MSGID/PACS008 keys
-        to an already-known member)."""
+        to an already-known member). Chunked — see KEY_INSERT_CHUNK."""
         if not rows:
             return 0
         deduped = {(r["member_id"], r["key_type"], r["key_value"]): r for r in rows}
-        stmt = (
-            pg_insert(MovementLotKey.__table__)
-            .values(list(deduped.values()))
-            .on_conflict_do_nothing(
-                index_elements=["member_id", "key_type", "key_value"]
+        values = list(deduped.values())
+        inserted = 0
+        for i in range(0, len(values), KEY_INSERT_CHUNK):
+            stmt = (
+                pg_insert(MovementLotKey.__table__)
+                .values(values[i : i + KEY_INSERT_CHUNK])
+                .on_conflict_do_nothing(
+                    index_elements=["member_id", "key_type", "key_value"]
+                )
             )
-        )
-        result = db.execute(stmt)
-        return result.rowcount or 0
+            inserted += db.execute(stmt).rowcount or 0
+        return inserted
 
     def sync_lot_currencies(self, db: Session, *, lot_ids: Sequence[str]) -> None:
         """Lot currency = its first member's (informational rollup)."""
@@ -224,26 +234,97 @@ class MovementLotRepository:
         )
 
     def find_cross_lot_conflicts(
-        self, db: Session, *, flow_source_id: int, limit: int = 5
+        self,
+        db: Session,
+        *,
+        flow_source_id: int,
+        keys: Optional[Sequence[Tuple[str, str]]] = None,
+        limit: int = 5,
     ) -> List[Any]:
         """Integrity guard: a key attached (via members) to more than one ACTIVE
         lot means the DAG clustered against a stale key map — the batch must be
-        rolled back and the run retried."""
-        return db.execute(
-            text(
-                """
+        rolled back and the run retried.
+
+        ``keys`` restricts the check to the (key_type, key_value) pairs a batch
+        just wrote, which is what apply_lot_batch passes. That is not a weaker
+        check, it is the same check done where a conflict can actually appear:
+
+        * a batch can only attach a key to a new lot through the keys it writes,
+          and key_specs carries a re-clustered member's WHOLE key set, not just
+          its new keys — so a member moving lots is fully covered;
+        * a merge only ever moves members INTO a survivor, which can lower a
+          key's distinct-lot count but never raise it;
+        * every earlier batch ran this same guard over its own keys, so anything
+          it could have introduced was already caught (and rolled back).
+
+        Without ``keys`` the aggregate spans the entire source: a full scan of
+        movement_lot_key joined to every member and lot, with the LIMIT applied
+        only AFTER the hash aggregate. That form is fine as a one-off audit but
+        costs O(batches x source_keys) — quadratic — when run per batch. Keep it
+        for whole-source verification only.
+        """
+        scoped = keys is not None
+        if scoped and not keys:
+            return []
+
+        source_filter = "WHERE l.flow_source_id = :fsid AND l.status = :active"
+        params: Dict[str, Any] = {
+            "fsid": flow_source_id,
+            "active": LOT_STATUS_ACTIVE,
+            "limit": limit,
+        }
+        if scoped:
+            # Driving from the batch's keys turns the scan into an index lookup
+            # on ix_movement_lot_key_value (key_type, key_value).
+            driver = """
+                WITH batch_keys AS (
+                    SELECT DISTINCT kt, kv
+                    FROM unnest(
+                        CAST(:key_types AS text[]), CAST(:key_values AS text[])
+                    ) AS t(kt, kv)
+                )
+                SELECT k.key_type, k.key_value, COUNT(DISTINCT m.lot_id) AS lot_count
+                FROM batch_keys bk
+                JOIN reco.movement_lot_key k
+                  ON k.key_type = bk.kt AND k.key_value = bk.kv
+                JOIN reco.movement_lot_member m ON m.id = k.member_id
+                JOIN reco.movement_lot l ON l.id = m.lot_id
+            """
+            deduped = sorted({(kt, kv) for kt, kv in keys})
+            params["key_types"] = [kt for kt, _ in deduped]
+            params["key_values"] = [kv for _, kv in deduped]
+        else:
+            driver = """
                 SELECT k.key_type, k.key_value, COUNT(DISTINCT m.lot_id) AS lot_count
                 FROM reco.movement_lot_key k
                 JOIN reco.movement_lot_member m ON m.id = k.member_id
                 JOIN reco.movement_lot l ON l.id = m.lot_id
-                WHERE l.flow_source_id = :fsid AND l.status = :active
+            """
+
+        return db.execute(
+            text(
+                f"""
+                {driver}
+                {source_filter}
                 GROUP BY k.key_type, k.key_value
                 HAVING COUNT(DISTINCT m.lot_id) > 1
                 LIMIT :limit
                 """
             ),
-            {"fsid": flow_source_id, "active": LOT_STATUS_ACTIVE, "limit": limit},
+            params,
         ).fetchall()
+
+    def lot_currencies(self, db: Session, *, lot_ids: Sequence[str]) -> Dict[str, str]:
+        """{lot_id: currency} for the ids that exist — existence check and stored
+        currency in one query (apply_lot_batch needs both)."""
+        if not lot_ids:
+            return {}
+        rows = (
+            db.query(MovementLot.id, MovementLot.currency)
+            .filter(MovementLot.id.in_(list(lot_ids)))
+            .all()
+        )
+        return {r[0]: r[1] for r in rows}
 
     def lots_exist(self, db: Session, *, lot_ids: Sequence[str]) -> set:
         if not lot_ids:

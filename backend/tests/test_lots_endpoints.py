@@ -146,35 +146,38 @@ def test_get_lot_detail_giant_lot_flags_members_omitted(client, monkeypatch):
 
 GRAPH = {
     "lot_id": "11111111-1111-4111-8111-111111111111",
-    "key_types": [
-        {"key_type": "PACS008", "distinct_count": 51994, "member_link_count": 52000}
+    "keys": [
+        {"id": "PACS008:P1", "key_type": "PACS008", "key_value": "P1", "member_count": 51994}
     ],
     "groups": [
         {
+            "id": "g0",
             "movement_type": "NDGB",
-            "direction": "credit",
             "member_count": 51990,
             "total_amount": Decimal("123456.78"),
             "pending_count": 51990,
             "matched_count": 0,
             "excluded_count": 0,
+            "key_ids": ["PACS008:P1"],
         },
         {
+            "id": "g1",
             "movement_type": "SWIFT",
-            "direction": "debit",
             "member_count": 10,
             "total_amount": Decimal("-10.00"),
             "pending_count": 0,
             "matched_count": 10,
             "excluded_count": 0,
+            "key_ids": [],
         },
-    ],
-    "edges": [
-        {"movement_type": "NDGB", "direction": "credit", "key_type": "PACS008"}
     ],
     "meta": {
         "member_count": 52000,
         "type_counts": {"NDGB": 51990, "SWIFT": 10},
+        "hub_key_count": 3,
+        "hub_keys_truncated": True,
+        "group_count": 2,
+        "groups_truncated": False,
     },
 }
 
@@ -182,68 +185,16 @@ GRAPH = {
 def test_get_lot_graph_shape_and_404(client, monkeypatch):
     monkeypatch.setattr(
         lot_service, "get_lot_graph",
-        lambda db, lot_id, key_type=None, key_value=None: (
-            GRAPH if lot_id == GRAPH["lot_id"] else None
-        ),
+        lambda db, lot_id: GRAPH if lot_id == GRAPH["lot_id"] else None,
     )
     ok = client.get(f"/lots/{GRAPH['lot_id']}/graph")
     assert ok.status_code == 200
     body = ok.json()
-    assert body["key_types"][0]["key_type"] == "PACS008"
-    assert body["key_types"][0]["distinct_count"] == 51994
+    assert body["keys"][0]["id"] == "PACS008:P1"
     assert body["groups"][0]["member_count"] == 51990
-    assert body["groups"][0]["direction"] == "credit"
-    assert body["edges"][0]["key_type"] == "PACS008"
-    assert body["meta"]["type_counts"]["NDGB"] == 51990
+    assert body["groups"][1]["key_ids"] == []
+    assert body["meta"]["hub_keys_truncated"] is True
     assert client.get("/lots/unknown-lot/graph").status_code == 404
-
-
-def test_get_lot_graph_scoped_passthrough(client, monkeypatch):
-    captured = {}
-
-    def fake_graph(db, lot_id, key_type=None, key_value=None):
-        captured.update(lot_id=lot_id, key_type=key_type, key_value=key_value)
-        return GRAPH
-
-    monkeypatch.setattr(lot_service, "get_lot_graph", fake_graph)
-    resp = client.get(
-        f"/lots/{GRAPH['lot_id']}/graph",
-        params={"key_type": "PACS008", "key_value": "P1"},
-    )
-    assert resp.status_code == 200
-    assert captured == {
-        "lot_id": GRAPH["lot_id"],
-        "key_type": "PACS008",
-        "key_value": "P1",
-    }
-
-
-def test_list_lot_key_values_and_validation(client, monkeypatch):
-    captured = {}
-
-    def fake_key_values(db, **kwargs):
-        if kwargs["lot_id"] != GRAPH["lot_id"]:
-            return None
-        captured.update(kwargs)
-        return [{"key_value": "P1", "member_count": 2}], 51994
-
-    monkeypatch.setattr(lot_service, "list_lot_key_values", fake_key_values)
-    resp = client.get(
-        f"/lots/{GRAPH['lot_id']}/keys",
-        params={"key_type": "PACS008", "search": "P", "skip": 0, "limit": 100},
-    )
-    assert resp.status_code == 200
-    body = resp.json()
-    assert body["total_count"] == 51994
-    assert body["items"][0]["key_value"] == "P1"
-    assert captured["key_type"] == "PACS008"
-    assert captured["search"] == "P"
-    # key_type is required + pattern-validated
-    assert client.get(f"/lots/{GRAPH['lot_id']}/keys").status_code == 422
-    assert client.get(
-        f"/lots/{GRAPH['lot_id']}/keys", params={"key_type": "NOPE"}
-    ).status_code == 422
-    assert client.get("/lots/unknown-lot/keys", params={"key_type": "PACS008"}).status_code == 404
 
 
 def test_list_lot_members_filter_passthrough_and_404(client, monkeypatch):

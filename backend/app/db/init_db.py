@@ -8,7 +8,7 @@ from app.repositories.settings_repository import setting_repository
 from app.schemas.settings import SettingCreate
 from app.schemas.user import UserCreate
 from app.services.roles_services import role_service
-from app.services.settings_services import settings_service
+from app.services.settings_services import TABLE_COLUMNS_KEY, settings_service
 from app.services.sso_service import sso_service
 from app.services.user_service import UserService
 
@@ -135,6 +135,28 @@ def init_db(db: Session) -> None:
     # SSO global settings (sso_enabled, sso_force, sso_create_account_on_login, sso_default_role_id)
     sso_service.ensure_default_settings(db)
     print("SSO settings ensured.")
+
+    # Operational table columns per flow. Seeded with exactly the set that used
+    # to be hard-coded in OperationalView.vue (and the nostro_mirror variant that
+    # carried PaymentTimestamp), so making the columns configurable changes
+    # nothing on an existing install. Only created when absent — never
+    # overwrites an administrator's configuration.
+    if not settings_service.get_setting_by_key(db, key=TABLE_COLUMNS_KEY):
+        default_columns = [
+            "flow_id", "reco_id", "account", "amount", "payment_statuses",
+            "value_date", "event_type", "transaction_id",
+            "transaction_particulars", "ref_no", "remarks_1", "status",
+        ]
+        nostro_columns = default_columns.copy()
+        nostro_columns.insert(
+            default_columns.index("payment_statuses") + 1, "payment_timestamp"
+        )
+        settings_service.set_table_columns(
+            db, {"__default__": default_columns, "nostro_mirror": nostro_columns}
+        )
+        print(f"Setting '{TABLE_COLUMNS_KEY}' created.")
+    else:
+        print(f"Setting '{TABLE_COLUMNS_KEY}' already exists.")
 
     # Seed du rôle 'superadmin' (auto-attribué via SSO) avec accès ALL.
     superadmin_role = _ensure_superadmin_role(db)

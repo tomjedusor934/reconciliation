@@ -1,4 +1,12 @@
-from sqlalchemy import BigInteger, Column, Index, Numeric, String, UniqueConstraint
+from sqlalchemy import (
+    BigInteger,
+    Column,
+    DateTime,
+    Index,
+    Numeric,
+    String,
+    UniqueConstraint,
+)
 
 from app.db.base import Base
 
@@ -37,3 +45,14 @@ class EntryPaymentStatus(Base):
     # to show the real pending amount; the (reco_id, po_id) uniqueness means each
     # payment counts once per lot with no extra DISTINCT.
     amount = Column(Numeric(20, 4), nullable=True)
+    # = std.Payment.CreatedOn. Nullable until the DAG re-runs
+    # (PS_FULL_SYNC backfills). A reco can carry N payments hence N timestamps:
+    # the operational view shows the min→max span and filters on "at least one
+    # payment in range".
+    #
+    # WITHOUT TIME ZONE on purpose — unlike reconciliation_entry.value_date. The
+    # whole chain (datamart -> DAG -> API -> UI -> filter) keeps the datamart wall
+    # clock naive, so the hour shown in the table is exactly the hour the filter
+    # matches. Tagging it UTC would offset the display from the filter by the
+    # browser's offset, which defeats the point of an hour-level filter.
+    payment_timestamp = Column(DateTime, nullable=True)

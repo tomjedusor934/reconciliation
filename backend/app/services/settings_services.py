@@ -1,11 +1,22 @@
+import json
+import logging
 import re
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 from sqlalchemy.orm import Session
 
 from app.models.settings import Settings
 from app.repositories.settings_repository import setting_repository
 from app.schemas.settings import SettingCreate, SettingUpdate
+
+logger = logging.getLogger(__name__)
+
+# Operational table columns per flow code, stored as a JSON object in the single
+# ``settings`` row below. Seeded by init_db so the shipped behaviour is the
+# pre-existing column set. See app/db/init_db.py and the frontend catalogue in
+# frontend/src/config/entryColumns.ts.
+TABLE_COLUMNS_KEY = "reco_table_columns"
+TABLE_COLUMNS_DESCRIPTION = "Colonnes affichées par la vue opérationnelle, par code de flux"
 
 
 class SettingsService:
@@ -34,6 +45,50 @@ class SettingsService:
         db.commit()
         db.refresh(db_setting)
         return db_setting
+
+    # ------------------------------------------------------------------
+    # Operational table columns (JSON group over the key/value table)
+    # ------------------------------------------------------------------
+
+    def get_table_columns(self, db: Session) -> Dict[str, List[str]]:
+        """{flow_code: [column keys]} — ``{}`` when unset or unreadable.
+
+        JSON decoding is contained here so the raw string never reaches the
+        client through the generic SettingResponse. A corrupted value degrades
+        to the frontend defaults instead of breaking the operational view.
+        """
+        setting = setting_repository.get_by_key(db, key=TABLE_COLUMNS_KEY)
+        if not setting or not setting.value:
+            return {}
+        try:
+            data = json.loads(setting.value)
+        except (ValueError, TypeError):
+            logger.warning("[settings] %s holds invalid JSON — ignored", TABLE_COLUMNS_KEY)
+            return {}
+        if not isinstance(data, dict):
+            logger.warning("[settings] %s is not a JSON object — ignored", TABLE_COLUMNS_KEY)
+            return {}
+        return {
+            str(flow_code): [str(key) for key in keys]
+            for flow_code, keys in data.items()
+            if isinstance(keys, list)
+        }
+
+    def set_table_columns(self, db: Session, columns: Dict[str, List[str]]) -> Dict[str, List[str]]:
+        """Replace the whole map (upsert — the row may not exist yet)."""
+        value = json.dumps(columns, ensure_ascii=False)
+        setting = setting_repository.get_by_key(db, key=TABLE_COLUMNS_KEY)
+        if setting:
+            setting.value = value
+        else:
+            setting = Settings(
+                key=TABLE_COLUMNS_KEY,
+                value=value,
+                description=TABLE_COLUMNS_DESCRIPTION,
+            )
+        db.add(setting)
+        db.commit()
+        return self.get_table_columns(db)
 
     def get_password_settings(self, db: Session) -> Dict[str, Any]:
         """Récupère tous les settings liés aux mots de passe"""

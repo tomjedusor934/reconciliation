@@ -12,7 +12,10 @@ from sqlalchemy.orm import Session
 
 from app.models.flow import Flow
 from app.models.reconciliation_entry import UNRESOLVED_RECO_ID
-from app.repositories.payment_status_repository import payment_status_repository
+from app.repositories.payment_status_repository import (
+    PaymentAggregate,
+    payment_status_repository,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -21,7 +24,7 @@ class PaymentStatusService:
     def apply_status_batch(
         self, db: Session, *, flow: Flow, rows: Sequence[Any]
     ) -> Dict[str, int]:
-        """Upsert one batch of (reco_id, po_id, status, amount) rows.
+        """Upsert one batch of (reco_id, po_id, status, amount, payment_timestamp) rows.
 
         Rows without a usable reco_id (empty or the "Not Supported" sentinel)
         are counted ``skipped`` — they carry no reconciliation group to key on.
@@ -39,6 +42,7 @@ class PaymentStatusService:
                     "po_id": r.po_id,
                     "status": r.status,
                     "amount": getattr(r, "amount", None),
+                    "payment_timestamp": getattr(r, "payment_timestamp", None),
                 }
             )
         inserted, updated, unchanged = payment_status_repository.upsert_statuses(db, to_upsert)
@@ -77,7 +81,7 @@ class PaymentStatusService:
 
     def aggregate_for_reco_ids(
         self, db: Session, *, reco_ids: Sequence[str]
-    ) -> Dict[str, Dict[str, int]]:
+    ) -> Dict[str, PaymentAggregate]:
         return payment_status_repository.aggregate_for_reco_ids(db, reco_ids=reco_ids)
 
     def distinct_statuses(self, db: Session) -> List[str]:

@@ -10,7 +10,7 @@ member row must hash EXACTLY like its entry does through the finacle push path
 import logging
 from datetime import datetime, timezone
 from decimal import Decimal
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
@@ -107,7 +107,11 @@ class LotService:
     ) -> Dict[str, Any]:
         """One atomic transaction: create lots → apply merges (with the targeted
         pending-entry relink) → upsert members (hash computed here) → accrue
-        keys → cross-lot-key guard → commit."""
+        keys → cross-lot-key guard → commit.
+
+        Everything here must stay proportional to the BATCH, never to the source:
+        a full run is hundreds of these calls, so any per-batch step that scans
+        what previous batches wrote turns the run quadratic."""
         try:
             lots_created = movement_lot_repository.create_lots(
                 db,
@@ -173,8 +177,10 @@ class LotService:
                 key_specs[source_hash] = [(k.key_type, k.key_value) for k in member.keys]
 
             target_lot_ids = {row["lot_id"] for row in member_rows.values()}
-            known = movement_lot_repository.lots_exist(db, lot_ids=list(target_lot_ids))
-            missing = target_lot_ids - known
+            stored_currencies = movement_lot_repository.lot_currencies(
+                db, lot_ids=list(target_lot_ids)
+            )
+            missing = target_lot_ids - set(stored_currencies)
             if missing:
                 raise ValueError(f"members reference unknown lot(s): {sorted(missing)[:5]}")
 
@@ -188,10 +194,28 @@ class LotService:
                 if h in ids_by_hash
             ]
             keys_added = movement_lot_repository.insert_keys(db, key_rows)
-            movement_lot_repository.sync_lot_currencies(db, lot_ids=list(target_lot_ids))
+            # The rollup re-derives a lot's currency with a DISTINCT ON over ALL
+            # its members, so handing it every lot the batch touches re-scans the
+            # source's biggest lot on every single batch — the same quadratic trap
+            # as the guard below. A lot whose stored currency already matches
+            # every member this batch brings cannot come out of that UPDATE with a
+            # different value, so it is skipped; a lot the batch could move (new,
+            # or genuinely mixed-currency) is still passed through untouched.
+            currency_candidates = {
+                row["lot_id"]
+                for row in member_rows.values()
+                if stored_currencies.get(row["lot_id"]) != row["currency"]
+            }
+            movement_lot_repository.sync_lot_currencies(
+                db, lot_ids=list(currency_candidates)
+            )
 
+            # Scoped to the batch's own keys — see find_cross_lot_conflicts for
+            # why that catches everything this batch could have introduced.
             conflicts = movement_lot_repository.find_cross_lot_conflicts(
-                db, flow_source_id=source.id
+                db,
+                flow_source_id=source.id,
+                keys=[(r["key_type"], r["key_value"]) for r in key_rows],
             )
             if conflicts:
                 sample = ", ".join(f"{c.key_type}:{c.key_value}" for c in conflicts)
@@ -273,6 +297,19 @@ class LotService:
             skip=skip, limit=limit,
         )
         return [self._row_to_summary(r) for r in rows], total
+
+    def get_lot_summaries(self, db: Session, *, lot_ids: Sequence[str]) -> List[Dict[str, Any]]:
+        """Summaries of these lots, unknown ids skipped.
+
+        Lighter than ``get_lot_detail`` (no members, no keys) — for callers that
+        only need to present the lots, such as the deep search.
+        """
+        out: List[Dict[str, Any]] = []
+        for lot_id in lot_ids:
+            row = movement_lot_repository.get_lot_summary(db, lot_id=lot_id)
+            if row is not None:
+                out.append(self._row_to_summary(row))
+        return out
 
     @staticmethod
     def _member_row_to_dict(m: Any) -> Dict[str, Any]:

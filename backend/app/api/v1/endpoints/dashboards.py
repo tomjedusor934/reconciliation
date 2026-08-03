@@ -1,17 +1,16 @@
-from typing import List
-
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 
 from app.api.v1 import deps
-from app.api.v1.filters import IngestionCalendarFilter, TransversalFilter
+from app.api.v1.filters import DeepSearchFilter, IngestionCalendarFilter
 from app.models.user import User
 from app.schemas.reconciliation import (
     DashboardResponse,
+    DeepSearchResponse,
     IngestionCalendarResponse,
-    TransversalGroup,
 )
 from app.services.dashboard_service import dashboard_service
+from app.services.search_service import search_service
 
 router = APIRouter()
 
@@ -35,10 +34,13 @@ def get_ingestion_calendar(
     )
 
 
-@router.get("/transversal", response_model=List[TransversalGroup])
-def get_transversal(
-    filters: TransversalFilter = Depends(),
+@router.get("/search", response_model=DeepSearchResponse)
+def deep_search(
+    filters: DeepSearchFilter = Depends(),
     db: Session = Depends(deps.get_db),
     _: User = Depends(deps.get_current_active_user),
 ):
-    return dashboard_service.transversal(db, reco_id=filters.reco_id)
+    """Resolve any identifier to everything attached to it — lots, movements
+    (live AND émargé) and payments. Replaces the former /transversal, which only
+    matched reco_id and only read the live table."""
+    return search_service.search(db, query=filters.q, broad=filters.broad)

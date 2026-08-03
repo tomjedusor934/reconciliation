@@ -106,7 +106,11 @@ KEY_MSGID = "MSGID"
 KEY_PO = "PO"
 
 BB_CHUNK_SIZE = int(os.environ.get("RECO_FINACLE_BB_CHUNK_SIZE", str(CHUNK_SIZE)))
-MEMBER_PUSH_BATCH = int(os.environ.get("RECO_FINACLE_BB_MEMBER_BATCH", "2000"))
+# Members per lot POST. Each one is a full backend transaction, so fewer/bigger
+# beats more/smaller: a 600k-member run is 60 round-trips instead of 300. The
+# backend chunks the key INSERT itself (KEY_INSERT_CHUNK), so a high-fan-out
+# member in the batch no longer builds one oversized statement.
+MEMBER_PUSH_BATCH = int(os.environ.get("RECO_FINACLE_BB_MEMBER_BATCH", "10000"))
 # A MessageID mapped to more than this many DISTINCT pacs008 is a recurring
 # label ('ESCH/ALZETTE', 'ADEM-VIR<ts>'…), not an identifier — never a key.
 MSGID_MAX_PACS = int(os.environ.get("RECO_FINACLE_BB_MSGID_MAX_PACS", "3"))

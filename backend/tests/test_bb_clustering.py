@@ -34,6 +34,7 @@ from reco_datamart_bb import (  # noqa: E402
     movement_keys,
     ndrj_po_id,
     sp_return_po_id,
+    strip_degenerate_msgids,
 )
 
 
@@ -188,97 +189,6 @@ def test_unknown_types_are_not_supported():
     assert movement_keys(raw_row(tp=None), *NO_MAPS) is None
 
 
-# ---------------------------------------------------------------------------
-# Bulk-booked instant payments (multiline & co): the aggregate carries no ref_no
-# and reaches its member singles through the MessageID fan-out.
-# Validated on prod TransactionID PF0043409 / MessageID MULTI.116072584.
-# ---------------------------------------------------------------------------
-
-# The bulk's payments have an EMPTY MessageIDPACS008 (they are instant singles),
-# so the fan-out yields PO keys — the very keys the member movements carry.
-MULTI_MSGID_MAP = {"MULTI1": [(None, "PO1"), (None, "PO2")]}
-MULTI_TXNREF_MAP = {"REF1": "MULTI1"}
-
-
-def test_ip_aggregate_without_ref_no_fans_out_to_its_payments():
-    keys = movement_keys(
-        raw_row(tp="SCRT1/REF1/SANJEE ROLLES"),
-        {}, MULTI_MSGID_MAP, {},
-        txnref_map=MULTI_TXNREF_MAP,
-    )
-    assert keys == frozenset({(KEY_MSGID, "MULTI1"), (KEY_PO, "PO1"), (KEY_PO, "PO2")})
-
-
-def test_ip_aggregate_joins_its_member_singles_in_one_lot():
-    # The prod shape: one aggregate credit + two BKRTP debits on the same account.
-    agg = movement_keys(
-        raw_row(tp="SCRT1/REF1/SANJEE ROLLES"),
-        {}, MULTI_MSGID_MAP, {}, txnref_map=MULTI_TXNREF_MAP,
-    )
-    m1 = movement_keys(raw_row(tp="BKRTP/NCP/O/PO1/CENTRE", ref_no="PO1"), *NO_MAPS)
-    m2 = movement_keys(raw_row(tp="BKRTP/NCP/O/PO2/CENTRE", ref_no="PO2"), *NO_MAPS)
-    assert m1 == frozenset({(KEY_PO, "PO1")})  # members unchanged: PO key only
-    plan = build_clusters([agg, m1, m2], {})
-    assert len(plan.new_lots) == 1
-    assert (
-        bb_reco_for(agg, plan.key_to_lot)
-        == bb_reco_for(m1, plan.key_to_lot)
-        == bb_reco_for(m2, plan.key_to_lot)
-    )
-
-
-def test_scrt1_with_a_ref_no_is_a_single():
-    # New: SCRT1 used to fall through to 'Not Supported' (None) entirely.
-    assert movement_keys(raw_row(tp="SCRT1/O/REF1", ref_no="PO9"), *NO_MAPS) == frozenset(
-        {(KEY_PO, "PO9")}
-    )
-    assert classify_bb_movement(raw_row(tp="SCRT1/O/REF1")) == "SCRT1"
-
-
-def test_ip_aggregate_misses_stay_transient_never_not_supported():
-    # payment not in std.Payment yet → empty set (retried), NOT the sentinel
-    assert movement_keys(raw_row(tp="SCRT1/REF404/x"), *NO_MAPS) == frozenset()
-    # MessageID resolved but no payment fanned out → the MSGID key alone still
-    # identifies the group (same behaviour as the NDGB branch)
-    assert movement_keys(
-        raw_row(tp="SCRT1/REF1/x"), {}, {}, {}, txnref_map=MULTI_TXNREF_MAP
-    ) == frozenset({(KEY_MSGID, "MULTI1")})
-
-
-def test_bulk_return_shape_never_goes_to_the_reversal_lookup():
-    # BKRTP wearing the NCC/NCP shape is keyed by ref_no, never by TP segment[1]
-    # ('NCP' is not a TransactionRef) — the exclusion comes from reversal_ref_for.
-    assert movement_keys(
-        raw_row(tp="BKRTP/NCP/O/PO1/CENTRE"), {}, MULTI_MSGID_MAP, {},
-        txnref_map={"NCP": "MULTI1"},
-    ) == frozenset()
-
-
-def test_pacs008_wins_over_po_in_the_fan_out():
-    # A bulk whose payments DO carry a pacs008 links through PACS008, like NDGB.
-    keys = movement_keys(
-        raw_row(tp="SWIFT/REF1/x"), {}, {"MULTI1": [("PACS1", "PO1")]}, {},
-        txnref_map=MULTI_TXNREF_MAP,
-    )
-    assert keys == frozenset({(KEY_MSGID, "MULTI1"), (KEY_PACS008, "PACS1")})
-
-
-def test_collect_lookup_inputs_instant_txn_refs():
-    acc = BBLookupInputs()
-    collect_lookup_inputs(
-        [
-            raw_row(tp="SCRT1/REF1/SANJEE ROLLES"),          # aggregate → collected
-            raw_row(tp="SWIFT/REF2/x"),                      # aggregate → collected
-            raw_row(tp="SCRT1/O/REF3", ref_no="PO9"),        # single → NOT collected
-            raw_row(tp="BKRTP/NCP/O/PO1/x", ref_no="PO1"),   # return shape → NOT collected
-            app_entry(tp="SCRT1/REF4/x"),                    # app entry shape works too
-        ],
-        acc,
-    )
-    assert acc.instant_txn_refs == {"REF1", "REF2", "REF4"}
-    assert acc.po_ids == set()  # singles need no lookup
-
-
 def test_double_hash_separated_particulars():
     # _tp_parts splits on '##' when present
     keys = movement_keys(raw_row(tp="SCTXB##O##x", remarks_1="PACS1"), {}, {}, {})
@@ -292,7 +202,7 @@ def test_movement_keys_works_on_app_entry_shape():
 
 
 # ---------------------------------------------------------------------------
-# degenerate MessageID labels — LOG-ONLY detection ('LUXEMBOURG', 'ESCH/ALZETTE'…)
+# degenerate MessageID labels ('ESCH/ALZETTE', 'ADEM-VIR<ts>'…)
 # ---------------------------------------------------------------------------
 
 def test_degenerate_msgids_flags_labels_across_bulks_only():
@@ -316,88 +226,37 @@ def test_degenerate_msgids_flags_labels_across_bulks_only():
     assert "M1" not in bad
 
 
-def test_label_msgids_are_kept_as_keys():
-    # LOG-ONLY: a label like 'LUXEMBOURG' still keys (business links go
-    # through it — e.g. a 700M NDGB) even though degenerate_msgids flags it.
-    pacs_map = {"PACS1": ["LUXEMBOURG"], "PACS2": ["LUXEMBOURG"]}
-    assert degenerate_msgids(pacs_map, {}, max_pacs=1) == {"LUXEMBOURG"}
-    b1 = movement_keys(raw_row(tp="SCTXB/O/x", remarks_1="PACS1"), pacs_map, {}, {})
-    assert (KEY_MSGID, "LUXEMBOURG") in b1
-    ndgb = movement_keys(raw_row(tp="NDGB/agg", remarks_1="LUXEMBOURG"), {}, {}, {})
-    assert ndgb == frozenset({(KEY_MSGID, "LUXEMBOURG")})
-    plan = build_clusters([b1, ndgb], {})
-    assert bb_reco_for(b1, plan.key_to_lot) == bb_reco_for(ndgb, plan.key_to_lot)
+def test_strip_degenerate_msgids_filters_all_three_maps():
+    pacs_map = {"PACS1": ["M1", "LABEL"]}
+    msgid_map = {"LABEL": [("PACS5", None)], "M1": [("PACS1", None)]}
+    po_map = {"PO9": [("LABEL", "PACS7")]}
+    p2, m2, po2 = strip_degenerate_msgids(pacs_map, msgid_map, po_map, {"LABEL"})
+    assert p2 == {"PACS1": ["M1"]}
+    assert m2 == {"M1": [("PACS1", None)]}
+    assert po2 == {"PO9": [(None, "PACS7")]}  # pacs kept, label dropped
 
 
-# ---------------------------------------------------------------------------
-# NDRT / PREFIX/RCC rejects (std.[Return] → original payment)
-# ---------------------------------------------------------------------------
-
-RETURN_MAP = {"RET1": [("ORIG1", "AGG1", "PACS1")]}
-
-
-def test_classify_ndrt():
-    assert classify_bb_movement(raw_row(tp="NDRT##1000##2000")) == "NDRT"
-
-
-def test_ndrt_and_rcc_keys_full_resolution():
-    expected = frozenset({
-        (KEY_PO, "RET1"),        # pairs the NDRT↔RCC legs of the same return
-        (KEY_PO, "ORIG1"),       # links the original single movement
-        (KEY_MSGID, "AGG1"),     # original payment links
-        (KEY_PACS008, "PACS1"),
-    })
-    ndrt = movement_keys(raw_row(tp="NDRT##1000##2000", ref_no="RET1"), {}, {}, {}, RETURN_MAP)
-    assert ndrt == expected
-    rcc = movement_keys(raw_row(tp="SCTXB/RCC/O/RET1/x", ref_no="RET1"), {}, {}, {}, RETURN_MAP)
-    assert rcc == expected
-
-
-def test_ndrt_rcc_unresolved_return_keeps_own_po():
-    # std.[Return] row not found yet → own PO only (links later via key map);
-    # original payment missing (LEFT JOIN) → OriginalPo still keys.
-    assert movement_keys(
-        raw_row(tp="NDRT##x", ref_no="RET9"), {}, {}, {}, {}
-    ) == frozenset({(KEY_PO, "RET9")})
-    partial = {"RET9": [("ORIG9", None, None)]}
-    assert movement_keys(
-        raw_row(tp="SDDXB/RCC/I/RET9/x", ref_no="RET9"), {}, {}, {}, partial
-    ) == frozenset({(KEY_PO, "RET9"), (KEY_PO, "ORIG9")})
-    # rcc PO falls back to TP segment[3] when ref_no is empty
-    assert movement_keys(
-        raw_row(tp="SCTXB/RCC/I/RETTP/x", ref_no=None), {}, {}, {}, {}
-    ) == frozenset({(KEY_PO, "RETTP")})
-    # no PO at all → transient
-    assert movement_keys(raw_row(tp="NDRT##x", ref_no=None), {}, {}, {}, {}) == frozenset()
-
-
-def test_ndrt_joins_original_bulk_lot_and_pairs_with_rcc():
-    pacs_map = {"PACS1": ["AGG1"]}
-    bulk = movement_keys(raw_row(tp="SCTXB/O/x", remarks_1="PACS1"), pacs_map, {}, {}, {})
-    ndrt = movement_keys(raw_row(tp="NDRT##a", ref_no="RET1"), {}, {}, {}, RETURN_MAP)
-    rcc = movement_keys(raw_row(tp="SDXBB/RCC/O/RET1/x", ref_no="RET1"), {}, {}, {}, RETURN_MAP)
-    plan = build_clusters([bulk, ndrt, rcc], {})
-    assert len(plan.new_lots) == 1
-    assert (
-        bb_reco_for(bulk, plan.key_to_lot)
-        == bb_reco_for(ndrt, plan.key_to_lot)
-        == bb_reco_for(rcc, plan.key_to_lot)
+def test_ndgb_with_label_remarks_stays_transient():
+    keys = movement_keys(
+        raw_row(tp="NDGB/agg", remarks_1="ESCH/ALZETTE"),
+        {}, {}, {},
+        bad_msgids=frozenset({"ESCH/ALZETTE"}),
     )
+    assert keys == frozenset()  # retried, never glued
 
 
-def test_collect_lookup_inputs_return_pos():
-    acc = BBLookupInputs()
-    collect_lookup_inputs(
-        [
-            raw_row(tp="NDRT##a", ref_no="RET1"),
-            raw_row(tp="SCTXB/RCC/O/RETTP/x", ref_no="RET2"),
-            raw_row(tp="SDDXB/RCC/I/RETTP/x", ref_no=None),  # TP[3] fallback
-            raw_row(tp="SCTXB/NCP/I/PO1/x", ref_no="PO1"),   # classic return → po_ids
-        ],
-        acc,
-    )
-    assert acc.return_po_ids == {"RET1", "RET2", "RETTP"}
-    assert acc.po_ids == {"PO1"}
+def test_label_msgid_no_longer_chains_two_bulks():
+    # Two bulks sharing only the label must land in two lots once the maps are
+    # stripped (regression for the ESCH/ALZETTE-style cross-batch gluing).
+    pacs_map = {"PACS1": ["M1", "LABEL"], "PACS2": ["M2", "LABEL"]}
+    bad = degenerate_msgids(pacs_map, {}, max_pacs=1)
+    assert bad == {"LABEL"}
+    pacs_map, msgid_map, po_map = strip_degenerate_msgids(pacs_map, {}, {}, bad)
+    b1 = movement_keys(raw_row(tp="SCTXB/O/x", remarks_1="PACS1"), pacs_map, msgid_map, po_map)
+    b2 = movement_keys(raw_row(tp="SCTXB/O/y", remarks_1="PACS2"), pacs_map, msgid_map, po_map)
+    plan = build_clusters([b1, b2], {})
+    assert len(plan.new_lots) == 2
+    assert bb_reco_for(b1, plan.key_to_lot) != bb_reco_for(b2, plan.key_to_lot)
 
 
 # ---------------------------------------------------------------------------

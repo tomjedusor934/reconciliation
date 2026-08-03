@@ -4,7 +4,7 @@ from typing import Any, Dict
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
-from app.api.v1.deps import get_current_active_superuser, get_db
+from app.api.v1.deps import get_current_active_superuser, get_current_active_user, get_db
 from app.models.user import User
 from app.schemas.settings import (
     PasswordSettingsInput,
@@ -12,6 +12,7 @@ from app.schemas.settings import (
     PasswordValidationResponse,
     SettingResponse,
     SettingUpdate,
+    TableColumnsSettings,
 )
 from app.services.settings_services import settings_service
 
@@ -107,6 +108,31 @@ def update_password_settings(
         return settings_service.get_password_settings(db)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+@router.get("/table-columns", response_model=TableColumnsSettings)
+def get_table_columns(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_user),
+):
+    """Columns displayed by the operational table, per flow code.
+
+    Authenticated (not public like the app-name/password GETs): this is table
+    layout for a logged-in user, not login-page data.
+    """
+    return TableColumnsSettings(columns=settings_service.get_table_columns(db))
+
+
+@router.put("/table-columns", response_model=TableColumnsSettings)
+def update_table_columns(
+    settings_in: TableColumnsSettings,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_active_superuser),
+):
+    """Replace the whole per-flow column map."""
+    return TableColumnsSettings(
+        columns=settings_service.set_table_columns(db, settings_in.columns)
+    )
+
 
 @router.post("/validate-password", response_model=PasswordValidationResponse)
 def validate_password(

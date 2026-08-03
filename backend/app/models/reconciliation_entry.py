@@ -61,6 +61,11 @@ class ReconciliationEntry(Base):
     transaction_particulars = Column(String(512), nullable=True)
     ref_no = Column(String(128), nullable=True)
     remarks_1 = Column(String(255), nullable=True)
+    # Raw std.Movement.TransactionID — the business reference, NOT an identity:
+    # finacle recycles it daily and one id covers several legs, so it carries no
+    # index/constraint and stays out of every hash. ``external_ref`` derives from
+    # it (suffixed / MID: fallback) and remains the identity key.
+    transaction_id = Column(String(128), nullable=True)
 
     payload_raw = Column(JSONB, nullable=True)
     source_hash = Column(String(64), nullable=False)
@@ -100,6 +105,7 @@ class ReconciliationEntryEmargement(Base):
     transaction_particulars = Column(String(512), nullable=True)
     ref_no = Column(String(128), nullable=True)
     remarks_1 = Column(String(255), nullable=True)
+    transaction_id = Column(String(128), nullable=True)
     payload_raw = Column(JSONB, nullable=True)
     source_hash = Column(String(64), nullable=False)
     status = Column(Enum(EntryStatus, name="entry_status"), nullable=False)

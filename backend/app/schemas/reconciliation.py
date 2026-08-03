@@ -44,6 +44,7 @@ class ReconciliationEntryResponse(BaseModel):
     transaction_particulars: Optional[str] = None
     ref_no: Optional[str] = None
     remarks_1: Optional[str] = None
+    transaction_id: Optional[str] = None
     payload_raw: Optional[Dict[str, Any]]
     status: EntryStatus
     match_group_id: Optional[int]
@@ -51,6 +52,14 @@ class ReconciliationEntryResponse(BaseModel):
     # {payment status: count} for the movement's payments (std.Payment sync);
     # None for flows without payment tracking. Attached by the list service.
     payment_statuses: Optional[Dict[str, int]] = None
+    # Span of the CreatedOn of those same payments (both equal when the
+    # group carries a single timestamp). Naive: the datamart wall clock is kept
+    # as-is so the hour displayed is the hour filtered on. Attached by the service.
+    payment_timestamp_min: Optional[datetime] = None
+    payment_timestamp_max: Optional[datetime] = None
+    # 'live' | 'emargement' — which table the row was read from. Attached by the
+    # deep search so an émargé movement is visibly such; None elsewhere.
+    source: Optional[str] = None
     model_config = ConfigDict(from_attributes=True)
 
 
@@ -172,6 +181,36 @@ class TransversalGroup(BaseModel):
     entries: List[ReconciliationEntryResponse]
     sum: Decimal
     is_balanced: bool
+
+
+# ---------- Deep search (transversal) ----------
+class SearchMatch(BaseModel):
+    """Where the searched value was found — the trace explaining a result."""
+    source_table: str   # entry | entry_emargement | entry_payment_status | movement_lot_key | …
+    field: str          # the column that matched (po_id, reco_id, key PO/PACS008/MSGID, …)
+    value: str
+
+
+class SearchPayment(BaseModel):
+    reco_id: str
+    po_id: str
+    status: Optional[str] = None
+    amount: Optional[Decimal] = None
+    payment_timestamp: Optional[datetime] = None
+
+
+class DeepSearchResponse(BaseModel):
+    """Everything the searched value is attached to, across live and émargement."""
+    query: str
+    matches: List[SearchMatch] = []
+    # Lot summaries (same shape as the lots list); dict-typed to avoid a circular
+    # import with schemas.lot — the service fills it from lot_service._row_to_summary.
+    lots: List[Dict[str, Any]] = []
+    groups: List[TransversalGroup] = []
+    payments: List[SearchPayment] = []
+    # True when the broad ILIKE pass ran, and when a limit truncated the results.
+    broad_used: bool = False
+    truncated: bool = False
 
 
 class PaginatedEntriesResponse(BaseModel):

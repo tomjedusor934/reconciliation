@@ -136,6 +136,7 @@ class ReconciliationEntryRepository:
                 "transaction_particulars": stmt.excluded.transaction_particulars,
                 "ref_no": stmt.excluded.ref_no,
                 "remarks_1": stmt.excluded.remarks_1,
+                "transaction_id": stmt.excluded.transaction_id,
                 "payload_raw": stmt.excluded.payload_raw,
                 "ingestion_run_id": stmt.excluded.ingestion_run_id,
             },
@@ -433,6 +434,8 @@ class ReconciliationEntryRepository:
         amount_min=None,
         amount_max=None,
         payment_statuses=None,
+        payment_timestamp_from=None,
+        payment_timestamp_to=None,
         account=None,
         date_from=None,
         date_to=None,
@@ -467,6 +470,19 @@ class ReconciliationEntryRepository:
                         and_(EntryPaymentStatus.reco_id == model.reco_id, or_(*conds))
                     )
                 )
+        if payment_timestamp_from or payment_timestamp_to:
+            # Same semantics as payment_statuses: keep the row if AT LEAST ONE of
+            # the group's payments falls in the range. Correlated EXISTS (never a
+            # JOIN) — this builder also runs against the émargement table and
+            # against a COUNT(), which a join would fan out.
+            # Both bounds inclusive, compared as-is: the column is naive and so
+            # are the bounds, so an hour bound means that exact wall-clock hour.
+            conds = [EntryPaymentStatus.reco_id == model.reco_id]
+            if payment_timestamp_from:
+                conds.append(EntryPaymentStatus.payment_timestamp >= payment_timestamp_from)
+            if payment_timestamp_to:
+                conds.append(EntryPaymentStatus.payment_timestamp <= payment_timestamp_to)
+            q = q.filter(exists().where(and_(*conds)))
         if account:
             q = q.filter(model.account == account)
         if date_from:
@@ -507,6 +523,8 @@ class ReconciliationEntryRepository:
         amount_min: Optional[Decimal] = None,
         amount_max: Optional[Decimal] = None,
         payment_statuses: Optional[Sequence[str]] = None,
+        payment_timestamp_from: Optional[datetime] = None,
+        payment_timestamp_to: Optional[datetime] = None,
         account: Optional[str] = None,
         date_from: Optional[date] = None,
         date_to: Optional[date] = None,
@@ -518,7 +536,10 @@ class ReconciliationEntryRepository:
         kw = dict(
             flow_id=flow_id, status=status, reco_id=reco_id,
             amount_min=amount_min, amount_max=amount_max,
-            payment_statuses=payment_statuses, account=account,
+            payment_statuses=payment_statuses,
+            payment_timestamp_from=payment_timestamp_from,
+            payment_timestamp_to=payment_timestamp_to,
+            account=account,
             date_from=date_from, date_to=date_to, search=search,
         )
 
@@ -552,6 +573,8 @@ class ReconciliationEntryRepository:
         amount_min: Optional[Decimal] = None,
         amount_max: Optional[Decimal] = None,
         payment_statuses: Optional[Sequence[str]] = None,
+        payment_timestamp_from: Optional[datetime] = None,
+        payment_timestamp_to: Optional[datetime] = None,
         account: Optional[str] = None,
         date_from: Optional[date] = None,
         date_to: Optional[date] = None,
@@ -562,7 +585,10 @@ class ReconciliationEntryRepository:
         kw = dict(
             flow_id=flow_id, status=status, reco_id=reco_id,
             amount_min=amount_min, amount_max=amount_max,
-            payment_statuses=payment_statuses, account=account,
+            payment_statuses=payment_statuses,
+            payment_timestamp_from=payment_timestamp_from,
+            payment_timestamp_to=payment_timestamp_to,
+            account=account,
             date_from=date_from, date_to=date_to, search=search,
         )
         total = 0
@@ -694,15 +720,34 @@ class ReconciliationEntryRepository:
         db.commit()
         return result
 
-    def list_by_reco_id(
-        self, db: Session, *, reco_id: str
-    ) -> List[ReconciliationEntry]:
-        return (
-            db.query(ReconciliationEntry)
-            .filter(ReconciliationEntry.reco_id == reco_id)
-            .order_by(ReconciliationEntry.value_date.asc())
-            .all()
-        )
+    def list_by_reco_ids(
+        self, db: Session, *, reco_ids: Sequence[str]
+    ) -> List[Tuple[str, object]]:
+        """``(source, entry)`` for these reco_ids, across BOTH entry tables.
+
+        Reading the live table alone would return nothing for an already
+        reconciled group: ``move_matched_to_emargement`` DELETEs those rows from
+        the live table. ``source`` ('live' / 'emargement') is carried out because
+        the two tables can hold the same ``id`` — it is copied on the move, and
+        no cross-table constraint enforces uniqueness.
+        """
+        if not reco_ids:
+            return []
+        ids = list(reco_ids)
+        out: List[Tuple[str, object]] = []
+        for source, model in (
+            ("live", ReconciliationEntry),
+            ("emargement", ReconciliationEntryEmargement),
+        ):
+            rows = (
+                db.query(model)
+                .filter(model.reco_id.in_(ids))
+                .order_by(model.value_date.asc())
+                .all()
+            )
+            out.extend((source, row) for row in rows)
+        out.sort(key=lambda pair: (pair[1].value_date, pair[1].id))
+        return out
 
     # ---------- KPIs / dashboard ----------
     def kpis_by_flow(self, db: Session) -> List[dict]:
@@ -748,13 +793,13 @@ class ReconciliationEntryRepository:
             INSERT INTO reco.reconciliation_entry_emargement (
                 id, flow_id, ingestion_run_id, reco_id, account, currency, amount,
                 direction, value_date, operation_date, event_type, external_ref,
-                file_name, transaction_particulars, ref_no, remarks_1,
+                file_name, transaction_particulars, ref_no, remarks_1, transaction_id,
                 payload_raw, source_hash, status, match_group_id, matched_at,
                 emarged_at, created_at, updated_at
             )
             SELECT id, flow_id, ingestion_run_id, reco_id, account, currency, amount,
                    direction, value_date, operation_date, event_type, external_ref,
-                   file_name, transaction_particulars, ref_no, remarks_1,
+                   file_name, transaction_particulars, ref_no, remarks_1, transaction_id,
                    payload_raw, source_hash, status, match_group_id, matched_at,
                    :now, created_at, updated_at
             FROM moved
@@ -787,13 +832,13 @@ class ReconciliationEntryRepository:
             INSERT INTO reco.reconciliation_entry_emargement (
                 id, flow_id, ingestion_run_id, reco_id, account, currency, amount,
                 direction, value_date, operation_date, event_type, external_ref,
-                file_name, transaction_particulars, ref_no, remarks_1,
+                file_name, transaction_particulars, ref_no, remarks_1, transaction_id,
                 payload_raw, source_hash, status, match_group_id, matched_at,
                 emarged_at, created_at, updated_at
             )
             SELECT id, flow_id, ingestion_run_id, reco_id, account, currency, amount,
                    direction, value_date, operation_date, event_type, external_ref,
-                   file_name, transaction_particulars, ref_no, remarks_1,
+                   file_name, transaction_particulars, ref_no, remarks_1, transaction_id,
                    payload_raw, source_hash, status, match_group_id, matched_at,
                    :now, created_at, updated_at
             FROM moved
@@ -826,13 +871,13 @@ class ReconciliationEntryRepository:
             INSERT INTO reco.reconciliation_entry (
                 id, flow_id, ingestion_run_id, reco_id, account, currency, amount,
                 direction, value_date, operation_date, event_type, external_ref,
-                file_name, transaction_particulars, ref_no, remarks_1,
+                file_name, transaction_particulars, ref_no, remarks_1, transaction_id,
                 payload_raw, source_hash, status, match_group_id, matched_at,
                 created_at, updated_at
             )
             SELECT id, flow_id, ingestion_run_id, reco_id, account, currency, amount,
                    direction, value_date, operation_date, event_type, external_ref,
-                   file_name, transaction_particulars, ref_no, remarks_1,
+                   file_name, transaction_particulars, ref_no, remarks_1, transaction_id,
                    payload_raw, source_hash, 'PENDING',
                    NULL, NULL,
                    created_at, :now

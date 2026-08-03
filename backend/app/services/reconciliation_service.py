@@ -53,6 +53,8 @@ class ReconciliationService:
         amount_min=None,
         amount_max=None,
         payment_statuses=None,
+        payment_timestamp_from=None,
+        payment_timestamp_to=None,
         account=None,
         date_from=None,
         date_to=None,
@@ -68,6 +70,8 @@ class ReconciliationService:
             amount_min=amount_min,
             amount_max=amount_max,
             payment_statuses=payment_statuses,
+            payment_timestamp_from=payment_timestamp_from,
+            payment_timestamp_to=payment_timestamp_to,
             account=account,
             date_from=date_from,
             date_to=date_to,
@@ -76,16 +80,19 @@ class ReconciliationService:
         items = reconciliation_entry_repository.list_filtered(db, **filter_kwargs, skip=skip, limit=limit)
         total_count = reconciliation_entry_repository.count_filtered(db, **filter_kwargs)
         if with_payment_statuses:
-            # Per-reco payment statuses ("3 ACC · 2 PDNG" in the operational
-            # view) — one aggregate query for the page. Payments are keyed by
-            # reco_id, so every entry of a reconciliation group shows the same
-            # set; entries without a reco_id show nothing.
+            # Per-reco payment aggregate ("3 ACC · 2 PDNG" + the timestamp span
+            # in the operational view) — one query for the page. Payments are
+            # keyed by reco_id, so every entry of a reconciliation group shows the
+            # same set; entries without a reco_id show nothing.
             reco_ids = {e.reco_id for e in items if e.reco_id}
             agg = payment_status_service.aggregate_for_reco_ids(
                 db, reco_ids=list(reco_ids)
             )
             for entry in items:
-                setattr(entry, "payment_statuses", agg.get(entry.reco_id))
+                summary = agg.get(entry.reco_id)
+                setattr(entry, "payment_statuses", summary.statuses if summary else None)
+                setattr(entry, "payment_timestamp_min", summary.payment_timestamp_min if summary else None)
+                setattr(entry, "payment_timestamp_max", summary.payment_timestamp_max if summary else None)
         return items, total_count
 
     def distinct_payment_statuses(self, db: Session) -> List[str]:
@@ -109,6 +116,8 @@ class ReconciliationService:
             amount_min=filters.amount_min,
             amount_max=filters.amount_max,
             payment_statuses=filters.payment_statuses,
+            payment_timestamp_from=filters.payment_timestamp_from,
+            payment_timestamp_to=filters.payment_timestamp_to,
             account=filters.account,
             date_from=filters.date_from,
             date_to=filters.date_to,
@@ -127,16 +136,6 @@ class ReconciliationService:
 
         header_fill = PatternFill(start_color="2B2D42", end_color="2B2D42", fill_type="solid")
         header_text = Font(bold=True, color="FFFFFF")
-        headers = [
-            "Flow", "Reco ID", "Account", "Currency", "Amount", "Direction",
-            "Value date", "Operation date", "Event type", "External ref",
-            "File name", "Particulars", "Ref no", "Remarks 1", "Status", "Matched at",
-            "Payments",
-        ]
-        for col_idx, header in enumerate(headers, 1):
-            cell = ws.cell(row=1, column=col_idx, value=header)
-            cell.font = header_text
-            cell.fill = header_fill
 
         def _enum(v):
             return v.value if v is not None else None
@@ -155,24 +154,49 @@ class ReconciliationService:
                 for status, count in sorted(agg.items(), key=lambda kv: (-kv[1], kv[0]))
             )
 
+        def _payment_timestamp(e):
+            # Same span rendering as the operational table: a single timestamp
+            # when every payment of the reco shares one, "min → max" otherwise.
+            low = getattr(e, "payment_timestamp_min", None)
+            high = getattr(e, "payment_timestamp_max", None)
+            if low is None and high is None:
+                return ""
+            if low == high or high is None:
+                return str(low)
+            return f"{low} → {high}" if low is not None else str(high)
+
+        # (header, value getter) pairs — one source of truth for the column order,
+        # so the data rows can never drift from the header row.
+        columns = [
+            ("Flow", lambda e: flow_codes.get(e.flow_id, f"#{e.flow_id}")),
+            ("Reco ID", lambda e: e.reco_id),
+            ("Account", lambda e: e.account),
+            ("Currency", lambda e: e.currency),
+            ("Amount", lambda e: float(e.amount) if e.amount is not None else None),
+            ("Direction", lambda e: _enum(e.direction)),
+            ("Value date", lambda e: _dt(e.value_date)),
+            ("Operation date", lambda e: _dt(e.operation_date)),
+            ("Event type", lambda e: e.event_type),
+            ("Transaction ID", lambda e: e.transaction_id),
+            ("External ref", lambda e: e.external_ref),
+            ("File name", lambda e: e.file_name),
+            ("Particulars", lambda e: e.transaction_particulars),
+            ("Ref no", lambda e: e.ref_no),
+            ("Remarks 1", lambda e: e.remarks_1),
+            ("Status", lambda e: _enum(e.status)),
+            ("Matched at", lambda e: _dt(e.matched_at)),
+            ("Payments", _payments),
+            ("PaymentTimestamp", _payment_timestamp),
+        ]
+
+        for col_idx, (header, _getter) in enumerate(columns, 1):
+            cell = ws.cell(row=1, column=col_idx, value=header)
+            cell.font = header_text
+            cell.fill = header_fill
+
         for row_idx, e in enumerate(items, 2):
-            ws.cell(row=row_idx, column=1, value=flow_codes.get(e.flow_id, f"#{e.flow_id}"))
-            ws.cell(row=row_idx, column=2, value=e.reco_id)
-            ws.cell(row=row_idx, column=3, value=e.account)
-            ws.cell(row=row_idx, column=4, value=e.currency)
-            ws.cell(row=row_idx, column=5, value=float(e.amount) if e.amount is not None else None)
-            ws.cell(row=row_idx, column=6, value=_enum(e.direction))
-            ws.cell(row=row_idx, column=7, value=_dt(e.value_date))
-            ws.cell(row=row_idx, column=8, value=_dt(e.operation_date))
-            ws.cell(row=row_idx, column=9, value=e.event_type)
-            ws.cell(row=row_idx, column=10, value=e.external_ref)
-            ws.cell(row=row_idx, column=11, value=e.file_name)
-            ws.cell(row=row_idx, column=12, value=e.transaction_particulars)
-            ws.cell(row=row_idx, column=13, value=e.ref_no)
-            ws.cell(row=row_idx, column=14, value=e.remarks_1)
-            ws.cell(row=row_idx, column=15, value=_enum(e.status))
-            ws.cell(row=row_idx, column=16, value=_dt(e.matched_at))
-            ws.cell(row=row_idx, column=17, value=_payments(e))
+            for col_idx, (_header, getter) in enumerate(columns, 1):
+                ws.cell(row=row_idx, column=col_idx, value=getter(e))
 
         # Auto-width columns (cap at 40), mirroring the archive export.
         for col in ws.columns:

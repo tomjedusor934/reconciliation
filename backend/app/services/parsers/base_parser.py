@@ -30,6 +30,7 @@ class ParsedEntry:
     transaction_particulars: Optional[str] = None
     ref_no: Optional[str] = None
     remarks_1: Optional[str] = None
+    transaction_id: Optional[str] = None  # raw std.Movement.TransactionID (never hashed)
     source_discriminator: Optional[str] = None  # extra identity token (e.g. MOSEL TMSEXT)
     payload_raw: Dict[str, Any] = field(default_factory=dict)
 

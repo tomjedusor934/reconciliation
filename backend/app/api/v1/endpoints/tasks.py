@@ -87,6 +87,7 @@ class FinacleEntryIn(BaseModel):
     transaction_particulars: Optional[str] = None
     ref_no: Optional[str] = None
     remarks_1: Optional[str] = None
+    transaction_id: Optional[str] = None
     payload_raw: Dict[str, Any] = Field(default_factory=dict)
 
 
@@ -183,6 +184,7 @@ def _to_parsed(e: FinacleEntryIn) -> ParsedEntry:
         transaction_particulars=e.transaction_particulars,
         ref_no=e.ref_no,
         remarks_1=e.remarks_1,
+        transaction_id=e.transaction_id,
         payload_raw=e.payload_raw,
     )
 
@@ -340,6 +342,9 @@ def list_finacle_unresolved(
             transaction_particulars=r.transaction_particulars,
             ref_no=r.ref_no,
             remarks_1=r.remarks_1,
+            # Kept on the round-trip: the DAG re-pushes these entries as-is, so
+            # dropping it here would blank the column through the upsert.
+            transaction_id=r.transaction_id,
             payload_raw=r.payload_raw or {},
         )
         for r in rows

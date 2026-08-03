@@ -37,6 +37,8 @@ def list_entries(
         amount_min=filters.amount_min,
         amount_max=filters.amount_max,
         payment_statuses=filters.payment_statuses,
+        payment_timestamp_from=filters.payment_timestamp_from,
+        payment_timestamp_to=filters.payment_timestamp_to,
         account=filters.account,
         date_from=filters.date_from,
         date_to=filters.date_to,
