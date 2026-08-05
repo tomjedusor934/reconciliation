@@ -30,9 +30,9 @@ class ReconciliationAlreadyRunning(ValueError):
     """Another process holds the reconciliation_entry writer lock — a run_auto
     or an émargement sweep is already in progress.
 
-    Subclasses ValueError to follow the repo's typed business-error convention
-    (cf. CrossLotKeyConflict), but the endpoints map it to 200/skipped rather
-    than a 4xx: nothing is wrong, someone else is simply doing the work.
+    Subclasses ValueError to follow the repo's typed business-error convention,
+    but the endpoints map it to 200/skipped rather than a 4xx: nothing is wrong,
+    someone else is simply doing the work.
     """
 
 

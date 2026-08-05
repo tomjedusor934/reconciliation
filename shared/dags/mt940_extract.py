@@ -338,13 +338,16 @@ def resolve_mt940_reco_ids(lookup_conn, refs) -> Dict[str, Optional[str]]:
     cursor = lookup_conn.cursor()
     try:
         cursor.execute("IF OBJECT_ID('tempdb..#mt940_ref') IS NOT NULL DROP TABLE #mt940_ref")
-        cursor.execute("CREATE TABLE #mt940_ref (ref VARCHAR(64) PRIMARY KEY)")
+        # Non-unique index, built after the load — see reco_datamart's
+        # _NON_UNIQUE_TEMP_INDEX for why a PRIMARY KEY here aborts whole runs.
+        cursor.execute("CREATE TABLE #mt940_ref (ref VARCHAR(64) NOT NULL)")
         cursor.fast_executemany = True
         for i in range(0, len(ref_list), PO_INSERT_BATCH):
             cursor.executemany(
                 "INSERT INTO #mt940_ref (ref) VALUES (?)",
                 [(r,) for r in ref_list[i:i + PO_INSERT_BATCH]],
             )
+        cursor.execute("CREATE CLUSTERED INDEX ix_temp_k ON #mt940_ref (ref)")
         cursor.execute(
             f"""
             SELECT t.ref, p.{PAYMENT_PO_ID_COLUMN}

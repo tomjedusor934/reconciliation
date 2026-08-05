@@ -69,6 +69,11 @@ class ReconciliationEntry(Base):
 
     payload_raw = Column(JSONB, nullable=True)
     source_hash = Column(String(64), nullable=False)
+    # Set on GHOST entries only (batch-booking splits): source_hash of the real
+    # movement this entry is a slice of — see app/models/movement_split.py. The
+    # real movement itself is withdrawn from this table, so a ghost never double
+    # counts against its parent. NULL = a real, whole movement.
+    split_parent_hash = Column(String(64), nullable=True)
 
     status = Column(Enum(EntryStatus, name="entry_status"), default=EntryStatus.PENDING, nullable=False)
     match_group_id = Column(BigInteger, nullable=True)
@@ -77,6 +82,7 @@ class ReconciliationEntry(Base):
     __table_args__ = (
         UniqueConstraint("source_hash", name="uq_reconciliation_entry_source_hash"),
         Index("ix_reconciliation_entry_flow_status_date", "flow_id", "status", "value_date"),
+        Index("ix_reconciliation_entry_split_parent", "split_parent_hash"),
         Index("ix_reconciliation_entry_reco_id", "reco_id"),
         Index("ix_reconciliation_entry_match_group", "match_group_id"),
         Index("ix_reconciliation_entry_value_date", "value_date"),
@@ -108,6 +114,7 @@ class ReconciliationEntryEmargement(Base):
     transaction_id = Column(String(128), nullable=True)
     payload_raw = Column(JSONB, nullable=True)
     source_hash = Column(String(64), nullable=False)
+    split_parent_hash = Column(String(64), nullable=True)
     status = Column(Enum(EntryStatus, name="entry_status"), nullable=False)
     match_group_id = Column(BigInteger, nullable=True)
     matched_at = Column(DateTime(timezone=True), nullable=True)
@@ -116,6 +123,7 @@ class ReconciliationEntryEmargement(Base):
     __table_args__ = (
         UniqueConstraint("source_hash", name="uq_reconciliation_entry_emargement_source_hash"),
         Index("ix_emargement_flow_status_date", "flow_id", "status", "value_date"),
+        Index("ix_emargement_split_parent", "split_parent_hash"),
         Index("ix_emargement_reco_id", "reco_id"),
         Index("ix_emargement_match_group", "match_group_id"),
         Index("ix_emargement_value_date", "value_date"),

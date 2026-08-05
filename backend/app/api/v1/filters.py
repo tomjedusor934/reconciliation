@@ -171,6 +171,19 @@ class LotListFilter:
         date_from: Optional[date] = Query(default=None, description="Member activity from (YYYY-MM-DD)"),
         date_to: Optional[date] = Query(default=None, description="Member activity to (YYYY-MM-DD)"),
         search: Optional[str] = Query(default=None, description="Lot uuid or key value (substring)"),
+        bucket_kind: Optional[str] = Query(
+            default=None,
+            pattern="^(PAIR|PACS_ONLY|MSGID_ONLY|PO|RESIDUAL|LEGACY)$",
+            description="What the bucket stands for (RESIDUAL = a split's leftover)",
+        ),
+        synthetic_only: Optional[bool] = Query(
+            default=None,
+            description="Buckets whose every member is a ghost (balanced by construction)",
+        ),
+        payment_gap: Optional[bool] = Query(
+            default=None,
+            description="Buckets holding a split whose booked amount disagrees with std.Payment",
+        ),
     ):
         self.flow_id = flow_id
         self.status = status
@@ -178,3 +191,6 @@ class LotListFilter:
         self.date_from = date_from
         self.date_to = date_to
         self.search = search
+        self.bucket_kind = bucket_kind
+        self.synthetic_only = synthetic_only
+        self.payment_gap = payment_gap

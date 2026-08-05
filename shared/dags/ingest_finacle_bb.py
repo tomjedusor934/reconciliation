@@ -1,10 +1,11 @@
 """Dedicated Finacle BATCH BOOKING TRUE ingestion DAG.
 
 Extracts movements from the datamart (std.Movement, MSSQL) for every active
-finacle_db source whose parser_type is ``finacle_batch_booking_true``, clusters
-them into lots (shared PACS008/MSGID/PO keys against std.Payment — see
-reco_datamart_bb), pushes the entries with ``reco_id = lot uuid`` through the
-regular finacle run lifecycle, then persists the lots/members/keys backend-side.
+finacle_db source whose parser_type is ``finacle_batch_booking_true``, buckets
+them by (PACS008 × MSGID) against std.Payment and splits the ones spanning
+several buckets into ghost movements (see reco_datamart_bb), pushes the entries
+with ``reco_id = bucket uuid`` through the regular finacle run lifecycle, then
+persists the split parents and the buckets/members/keys backend-side.
 
 Paused at creation: unpause once the `datamart` Airflow connection is set and
 at least one batch-booking source is active. The orchestrator DAG

@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onMounted, ref } from 'vue';
 import { useRouter } from 'vue-router';
-import { AlertTriangle } from 'lucide-vue-next';
+import { AlertTriangle, Layers } from 'lucide-vue-next';
 import Card from '@/components/ui/Card.vue';
 import Input from '@/components/ui/Input.vue';
 import Select from '@/components/ui/Select.vue';
@@ -33,6 +33,9 @@ const filters = ref({
   date_from: '',
   date_to: '',
   search: '',
+  bucket_kind: '',
+  synthetic_only: '',
+  payment_gap: '',
 });
 
 const statusOptions = [
@@ -40,6 +43,30 @@ const statusOptions = [
   { value: 'pending', label: 'Pending' },
   { value: 'matched', label: 'Matched' },
   { value: 'merged', label: 'Merged' },
+];
+
+const bucketKindOptions = [
+  { value: '', label: 'All buckets' },
+  { value: 'PAIR', label: 'PACS008 × MSGID' },
+  { value: 'PACS_ONLY', label: 'PACS008 only' },
+  { value: 'MSGID_ONLY', label: 'MSGID only' },
+  { value: 'PO', label: 'Single payment' },
+  { value: 'RESIDUAL', label: 'Residual (legacy runs)' },
+  { value: 'LEGACY', label: 'Legacy cluster' },
+];
+
+const syntheticOptions = [
+  { value: '', label: 'All' },
+  { value: 'true', label: 'Slices only' },
+  { value: 'false', label: 'Has a real movement' },
+];
+
+// A lot holding a slice whose movement's booked amount disagrees with what
+// std.Payment accounts for — a datamart signal, not an imbalance.
+const paymentGapOptions = [
+  { value: '', label: 'All' },
+  { value: 'true', label: 'With a payment gap' },
+  { value: 'false', label: 'Without' },
 ];
 
 const balancedOptions = [
@@ -54,7 +81,7 @@ const flowOptions = computed(() => [
 ]);
 
 const columns: Column[] = [
-  { key: 'lot_id', label: 'Lot' },
+  { key: 'lot_id', label: 'Bucket' },
   { key: 'flow_id', label: 'Flow' },
   { key: 'member_count', label: 'Movements', align: 'right' },
   { key: 'pending_count', label: 'Pending', align: 'right' },
@@ -71,6 +98,12 @@ const statusVariant = (s: string): 'success' | 'warning' | 'info' =>
 
 const flowName = (id: number) => flows.value.find((f) => f.id === id)?.code || `#${id}`;
 
+/** What the bucket stands for, falling back to the uuid for legacy lots. */
+const bucketLabel = (item: Record<string, any>): string => {
+  const parts = [item.bucket_pacs008, item.bucket_msgid, item.bucket_po].filter(Boolean);
+  return parts.length ? parts.join(' × ') : `${String(item.lot_id).slice(0, 8)}…`;
+};
+
 const buildParams = (skip: number): LotFilters => {
   const params: LotFilters = { limit: batchSize, skip };
   if (filters.value.flow_id) params.flow_id = Number(filters.value.flow_id);
@@ -79,6 +112,13 @@ const buildParams = (skip: number): LotFilters => {
   if (filters.value.date_from) params.date_from = filters.value.date_from;
   if (filters.value.date_to) params.date_to = filters.value.date_to;
   if (filters.value.search.trim()) params.search = filters.value.search.trim();
+  if (filters.value.bucket_kind) params.bucket_kind = filters.value.bucket_kind;
+  if (filters.value.synthetic_only) {
+    params.synthetic_only = filters.value.synthetic_only === 'true';
+  }
+  if (filters.value.payment_gap) {
+    params.payment_gap = filters.value.payment_gap === 'true';
+  }
   return params;
 };
 
@@ -142,10 +182,13 @@ onMounted(async () => {
   </div>
 
   <Card class="mb-4">
-    <div class="grid grid-cols-2 md:grid-cols-6 gap-3">
+    <div class="grid grid-cols-2 md:grid-cols-4 gap-3">
       <Select v-model="filters.flow_id" label="Flow" :options="flowOptions" />
       <Select v-model="filters.status" label="Status" :options="statusOptions" />
       <Select v-model="filters.balanced" label="Balance" :options="balancedOptions" />
+      <Select v-model="filters.bucket_kind" label="Bucket" :options="bucketKindOptions" />
+      <Select v-model="filters.synthetic_only" label="Content" :options="syntheticOptions" />
+      <Select v-model="filters.payment_gap" label="Payment data" :options="paymentGapOptions" />
       <Input v-model="filters.date_from" type="date" label="From" />
       <Input v-model="filters.date_to" type="date" label="To" />
       <Input v-model="filters.search" label="Lot uuid / key value" @keyup.enter="fetchLots" />
@@ -170,7 +213,23 @@ onMounted(async () => {
     >
       <template #cell-lot_id="{ item }">
         <span class="inline-flex items-center gap-1.5">
-          <span class="font-mono text-xs" :title="item.lot_id">{{ item.lot_id.slice(0, 8) }}…</span>
+          <!-- A bucket is identified by what it stands for; the uuid is only a
+               fallback for the lots inherited from the retired clustering. -->
+          <span class="font-mono text-xs" :title="item.lot_id">
+            {{ bucketLabel(item) }}
+          </span>
+          <span
+            v-if="item.bucket_kind === 'RESIDUAL'"
+            class="rounded-full bg-red-100 px-1.5 py-0.5 text-[10px] font-semibold text-red-700"
+            title="Holds what a split could not explain — charges, FX, or a payment missing from the datamart"
+          >
+            residual
+          </span>
+          <Layers
+            v-else-if="item.synthetic_only"
+            class="h-3.5 w-3.5 text-indigo-400"
+            title="Every movement here is a slice of a batch: the bucket balances by construction"
+          />
           <AlertTriangle
             v-if="item.merge_conflict"
             class="h-3.5 w-3.5 text-amber-500"

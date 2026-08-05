@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from 'vue';
-import { X } from 'lucide-vue-next';
+import { Layers, X } from 'lucide-vue-next';
 import Card from '@/components/ui/Card.vue';
 import Input from '@/components/ui/Input.vue';
 import Select from '@/components/ui/Select.vue';
@@ -27,6 +27,7 @@ const emit = defineEmits<{
   (e: 'update:filterType', value: string | null): void;
   (e: 'update:filterDirection', value: string | null): void;
   (e: 'update:filterKey', value: { key_type: string; key_value: string } | null): void;
+  (e: 'open-split', parentHash: string): void;
 }>();
 
 const loading = ref(false);
@@ -187,7 +188,23 @@ onMounted(fetchMembers);
       @page-change="onPageChange"
     >
       <template #cell-movement_type="{ item }">
-        <Badge variant="default">{{ item.movement_type }}</Badge>
+        <span class="inline-flex items-center gap-1.5">
+          <Badge variant="default">{{ item.movement_type }}</Badge>
+          <!-- On a big lot this is the only way into the split: the graph is
+               aggregated and never draws the individual ghost nodes. -->
+          <button
+            v-if="item.split_parent_hash"
+            type="button"
+            class="inline-flex items-center gap-0.5 rounded-full bg-indigo-50 px-1.5 py-0.5 text-[10px] font-semibold text-indigo-700 hover:bg-indigo-100"
+            :title="`Slice of ${item.split_parent_external_ref || 'a batch movement'}${
+              item.split_parent_amount ? ` (${formatAmount(item.split_parent_amount, item.currency)})` : ''
+            }`"
+            @click.stop="emit('open-split', item.split_parent_hash)"
+          >
+            <Layers class="h-2.5 w-2.5" />
+            slice
+          </button>
+        </span>
       </template>
       <template #cell-amount="{ item }">
         <span

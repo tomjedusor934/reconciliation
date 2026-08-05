@@ -16,7 +16,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.models.flow import Flow, FlowSource
-from app.models.movement_lot import KEY_TYPES, LOT_STATUS_MERGED
+from app.models.movement_lot import BUCKET_KINDS, KEY_TYPES, LOT_STATUS_MERGED
 from app.repositories.movement_lot_repository import movement_lot_repository
 from app.services.parsers.base_parser import ParsedEntry
 
@@ -25,12 +25,6 @@ logger = logging.getLogger(__name__)
 # Above this many members, GET /lots/{id} stops inlining members/keys and the
 # UI must use /graph (aggregate view) + /members (paginated) instead.
 LOT_DETAIL_INLINE_CAP = 400
-
-
-class CrossLotKeyConflict(ValueError):
-    """A key ended up attached to more than one active lot: the DAG clustered
-    against a stale key map. The batch is rolled back; the next run re-fetches
-    the map and re-clusters (self-healing)."""
 
 
 def _to_utc(dt: Optional[datetime]) -> Optional[datetime]:
@@ -83,18 +77,6 @@ class LotService:
     # DAG-facing writes
     # ------------------------------------------------------------------
 
-    def get_key_map(self, db: Session, *, flow_source_id: int) -> List[Dict[str, Any]]:
-        rows = movement_lot_repository.get_key_map(db, flow_source_id=flow_source_id)
-        return [
-            {
-                "key_type": r.key_type,
-                "key_value": r.key_value,
-                "lot_id": r.lot_id,
-                "lot_created_at": r.lot_created_at,
-            }
-            for r in rows
-        ]
-
     def apply_lot_batch(
         self,
         db: Session,
@@ -102,49 +84,32 @@ class LotService:
         flow: Flow,
         source: FlowSource,
         lots: List[Any],
-        merges: List[Any],
         members: List[Any],
     ) -> Dict[str, Any]:
-        """One atomic transaction: create lots → apply merges (with the targeted
-        pending-entry relink) → upsert members (hash computed here) → accrue
-        keys → cross-lot-key guard → commit.
+        """One atomic transaction: create buckets → upsert members (hash computed
+        here) → accrue keys → roll up currency and synthetic_only → commit.
 
         Everything here must stay proportional to the BATCH, never to the source:
         a full run is hundreds of these calls, so any per-batch step that scans
-        what previous batches wrote turns the run quadratic."""
+        what previous batches wrote turns the run quadratic.
+
+        There is no merge step and no cross-lot guard any more: a bucket id is a
+        uuid5 of its identity, so two batches naming the same bucket land on the
+        same row by construction and nothing can drift between runs."""
         try:
+            for lot in lots:
+                if lot.bucket_kind not in BUCKET_KINDS:
+                    raise ValueError(f"unknown bucket_kind {lot.bucket_kind!r}")
             lots_created = movement_lot_repository.create_lots(
                 db,
                 flow_id=flow.id,
                 flow_source_id=source.id,
-                lot_ids=[lot.lot_id for lot in lots],
+                buckets=[lot.model_dump() for lot in lots],
             )
-
-            merge_map: Dict[str, str] = {}
-            merges_applied = 0
-            entries_relinked = 0
-            for merge in merges:
-                result = movement_lot_repository.apply_merge(
-                    db,
-                    absorbed_id=merge.absorbed_lot_id,
-                    surviving_id=merge.surviving_lot_id,
-                    flow_source_id=source.id,
-                )
-                if not result.get("skipped"):
-                    merges_applied += 1
-                    entries_relinked += result.get("entries_relinked", 0)
-                merge_map[merge.absorbed_lot_id] = result.get(
-                    "surviving_id", merge.surviving_lot_id
-                )
 
             member_rows: Dict[str, dict] = {}
             key_specs: Dict[str, List[Tuple[str, str]]] = {}
             for member in members:
-                lot_id = member.lot_id
-                seen_chain = set()
-                while lot_id in merge_map and lot_id not in seen_chain:
-                    seen_chain.add(lot_id)
-                    lot_id = merge_map[lot_id]
                 for key in member.keys:
                     if key.key_type not in KEY_TYPES:
                         raise ValueError(f"unknown key_type {key.key_type!r}")
@@ -157,10 +122,25 @@ class LotService:
                     value_date=member.value_date,
                     operation_date=member.operation_date,
                 )
+                # A ghost shares its parent's account and dates — same movement,
+                # sliced — so the parent's hash comes out of the same formula
+                # with the parent's external_ref. Matches what split_service
+                # computed when it registered the parent.
+                split_parent_hash = (
+                    self.member_to_source_hash(
+                        flow_id=flow.id,
+                        external_ref=member.split_parent_external_ref,
+                        account=member.account,
+                        value_date=member.value_date,
+                        operation_date=member.operation_date,
+                    )
+                    if member.split_parent_external_ref
+                    else None
+                )
                 # Overlap re-streams can repeat a movement within one batch —
                 # later occurrence wins, mirroring the entry upsert.
                 member_rows[source_hash] = {
-                    "lot_id": lot_id,
+                    "lot_id": member.lot_id,
                     "source_hash": source_hash,
                     "movement_type": member.movement_type,
                     "external_ref": member.external_ref,
@@ -173,6 +153,8 @@ class LotService:
                     "transaction_particulars": member.transaction_particulars,
                     "ref_no": member.ref_no,
                     "remarks_1": member.remarks_1,
+                    "split_parent_hash": split_parent_hash,
+                    "payment_count": member.payment_count,
                 }
                 key_specs[source_hash] = [(k.key_type, k.key_value) for k in member.keys]
 
@@ -209,20 +191,10 @@ class LotService:
             movement_lot_repository.sync_lot_currencies(
                 db, lot_ids=list(currency_candidates)
             )
-
-            # Scoped to the batch's own keys — see find_cross_lot_conflicts for
-            # why that catches everything this batch could have introduced.
-            conflicts = movement_lot_repository.find_cross_lot_conflicts(
-                db,
-                flow_source_id=source.id,
-                keys=[(r["key_type"], r["key_value"]) for r in key_rows],
+            # Scoped to the lots this batch touched, for the same reason.
+            movement_lot_repository.sync_synthetic_only(
+                db, lot_ids=list(target_lot_ids)
             )
-            if conflicts:
-                sample = ", ".join(f"{c.key_type}:{c.key_value}" for c in conflicts)
-                raise CrossLotKeyConflict(
-                    f"key(s) attached to more than one active lot ({sample}) — "
-                    "stale key map, re-run the ingestion"
-                )
 
             db.commit()
         except IntegrityError as exc:
@@ -234,8 +206,6 @@ class LotService:
 
         return {
             "lots_created": lots_created,
-            "merges_applied": merges_applied,
-            "entries_relinked": entries_relinked,
             "members_inserted": inserted,
             "members_updated": updated,
             "keys_added": keys_added,
@@ -273,6 +243,12 @@ class LotService:
             "last_value_date": row.last_value_date,
             "merge_conflict": row.merge_conflict,
             "merged_into_lot_id": row.merged_into_lot_id,
+            "bucket_kind": row.bucket_kind,
+            "bucket_pacs008": row.bucket_pacs008 or None,
+            "bucket_msgid": row.bucket_msgid or None,
+            "bucket_po": row.bucket_po or None,
+            "bucket_ref": row.bucket_ref or None,
+            "synthetic_only": bool(row.synthetic_only),
             "created_at": row.created_at,
             "updated_at": row.updated_at,
         }
@@ -287,6 +263,9 @@ class LotService:
         date_from: Optional[datetime] = None,
         date_to: Optional[datetime] = None,
         search: Optional[str] = None,
+        bucket_kind: Optional[str] = None,
+        synthetic_only: Optional[bool] = None,
+        payment_gap: Optional[bool] = None,
         skip: int = 0,
         limit: int = 50,
     ) -> Tuple[List[Dict[str, Any]], int]:
@@ -294,6 +273,8 @@ class LotService:
             db,
             flow_id=flow_id, status=status, balanced=balanced,
             date_from=date_from, date_to=date_to, search=search,
+            bucket_kind=bucket_kind, synthetic_only=synthetic_only,
+            payment_gap=payment_gap,
             skip=skip, limit=limit,
         )
         return [self._row_to_summary(r) for r in rows], total
@@ -327,6 +308,10 @@ class LotService:
             "transaction_particulars": m.transaction_particulars,
             "ref_no": m.ref_no,
             "remarks_1": m.remarks_1,
+            "split_parent_hash": m.split_parent_hash,
+            "split_parent_external_ref": m.split_parent_external_ref,
+            "split_parent_amount": m.split_parent_amount,
+            "payment_count": m.payment_count,
             "entry_status": m.entry_status.lower() if m.entry_status else None,
             "entry_id": m.entry_id,
             "match_group_id": m.match_group_id,

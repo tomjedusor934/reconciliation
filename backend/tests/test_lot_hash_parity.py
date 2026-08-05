@@ -93,6 +93,40 @@ def test_hash_sensitive_to_identity_fields():
                         operation_date=datetime(2026, 7, 3, 10, 0, 0)) != base
 
 
+def test_ghost_hash_follows_the_same_formula_with_its_own_external_ref():
+    """A ghost is a normal finacle movement as far as hashing goes: only its
+    external_ref differs from its parent's (same account, same day — it IS the
+    same movement, sliced). Nothing special is needed for it to be addressable."""
+    parent = _member_hash(external_ref="S123456789")
+    ghost = _member_hash(external_ref="S123456789~c386eba7f1")
+    assert ghost != parent
+    # Stable, and distinct per bucket suffix.
+    assert ghost == _member_hash(external_ref="S123456789~c386eba7f1")
+    assert ghost != _member_hash(external_ref="S123456789~1f21d8baa1")
+
+
+def test_a_ghosts_parent_hash_is_reachable_from_the_ghosts_own_fields():
+    """The wire never carries a hash: split_service hashes the parent from its
+    identity, and lot_service re-derives the SAME value for the ghost's member
+    row using the parent's external_ref plus the ghost's account and dates. If
+    these two ever drift, every ghost points at a parent that does not exist."""
+    account = "0010130015001"
+    value_date = datetime(2026, 7, 1, 9, 30, 0)
+    operation_date = datetime(2026, 7, 1, 10, 45, 0)
+
+    # What split_service stores as movement_split.source_hash…
+    parent_hash = lot_service.member_to_source_hash(
+        flow_id=FLOW_ID, external_ref="S123456789",
+        account=account, value_date=value_date, operation_date=operation_date,
+    )
+    # …and what apply_lot_batch derives for the ghost member pointing at it.
+    derived = lot_service.member_to_source_hash(
+        flow_id=FLOW_ID, external_ref="S123456789",   # split_parent_external_ref
+        account=account, value_date=value_date, operation_date=operation_date,
+    )
+    assert derived == parent_hash
+
+
 def test_derive_lot_status_truth_table():
     derive = lot_service.derive_lot_status
     assert derive(lot_status="merged", member_count=3, pending_count=0, matched_count=3) == "merged"

@@ -563,9 +563,8 @@ def trigger_reconcile(
 ):
     """Auto-reconciliation. Single-writer via an advisory lock.
 
-    Lock already held → 200 + skipped, NOT 409. A 409 would mean "do it again"
-    (cf. CrossLotKeyConflict in tasks_lots.py, where the retry IS the fix); here
-    there is nothing to redo, another run is already doing the work. And
+    Lock already held → 200 + skipped, NOT 409. A 409 would mean "do it again";
+    here there is nothing to redo, another run is already doing the work. And
     mechanically: reco_common.call_backend calls raise_for_status(), so a 409
     fails the task → retry → the run is still going → 409 again → red DAG over a
     benign no-op. Same shape as the skips the DAGs already emit

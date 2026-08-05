@@ -2,9 +2,13 @@
 
 A full BB run pushes hundreds of ``/tasks/finacle-bb/lots/batch`` calls, so any
 per-batch step that re-reads what earlier batches wrote makes the run quadratic
-(a 595k-member run spent hours there). These tests lock the three places where
-that regression would come back: the cross-lot-key guard, the currency rollup,
-and the unbounded key INSERT.
+(a 595k-member run spent hours there). These tests lock the places where that
+regression would come back: the two rollups (currency, synthetic_only) and the
+unbounded key INSERT.
+
+The cross-lot-key guard that used to live here is gone with the union-find: a
+bucket id is a uuid5 of its identity, so a key cannot end up pointing at two
+lots by accident and there is nothing to verify after the write.
 
 DB-free: a fake Session records the statements instead of executing them
 (app.main is never imported — it connects to Postgres at import time).
@@ -54,48 +58,27 @@ def _sql(statement) -> str:
 
 
 # ---------------------------------------------------------------------------
-# find_cross_lot_conflicts
+# the rollups
 # ---------------------------------------------------------------------------
 
-def test_scoped_guard_is_driven_by_the_batch_keys():
-    """The batch's keys drive the join, so it is an index lookup on
-    ix_movement_lot_key_value instead of a full scan of the source."""
+def test_synthetic_only_rollup_is_scoped_to_the_batchs_lots():
+    """Same trap as the currency rollup: a GROUP BY over every member of the
+    source, run once per batch, is quadratic."""
     db = _FakeSession()
-    movement_lot_repository.find_cross_lot_conflicts(
-        db,
-        flow_source_id=7,
-        keys=[("PO", "b"), ("PACS008", "a"), ("PO", "b")],
-    )
+    movement_lot_repository.sync_synthetic_only(db, lot_ids=["lot-a", "lot-b"])
 
     statement, params = db.calls[0]
     sql = _sql(statement)
-    assert "batch_keys" in sql
-    assert "JOIN reco.movement_lot_key k ON k.key_type = bk.kt" in sql
-    # Deduplicated and paired positionally.
-    assert params["key_types"] == ["PACS008", "PO"]
-    assert params["key_values"] == ["a", "b"]
-    assert params["fsid"] == 7
+    assert "BOOL_AND(split_parent_hash IS NOT NULL)" in sql
+    assert "WHERE lot_id = ANY(:lot_ids)" in sql
+    assert params["lot_ids"] == ["lot-a", "lot-b"]
 
 
-def test_scoped_guard_with_no_keys_runs_no_query():
-    """An all-duplicates batch writes no key: nothing to check, nothing to scan."""
+def test_rollups_on_no_lots_run_no_query():
     db = _FakeSession()
-    assert movement_lot_repository.find_cross_lot_conflicts(
-        db, flow_source_id=7, keys=[]
-    ) == []
+    movement_lot_repository.sync_synthetic_only(db, lot_ids=[])
+    movement_lot_repository.sync_lot_currencies(db, lot_ids=[])
     assert db.calls == []
-
-
-def test_unscoped_guard_keeps_the_whole_source_form():
-    """keys=None stays available as a one-off audit over the entire source."""
-    db = _FakeSession()
-    movement_lot_repository.find_cross_lot_conflicts(db, flow_source_id=7)
-
-    statement, params = db.calls[0]
-    sql = _sql(statement)
-    assert "batch_keys" not in sql
-    assert "FROM reco.movement_lot_key k" in sql
-    assert "key_types" not in params
 
 
 # ---------------------------------------------------------------------------
@@ -154,7 +137,7 @@ class _Key:
 
 
 class _Member:
-    def __init__(self, lot_id, external_ref, keys, currency="EUR"):
+    def __init__(self, lot_id, external_ref, keys, currency="EUR", split_parent=None):
         self.lot_id = lot_id
         self.movement_type = "SCTXB"
         self.external_ref = external_ref
@@ -167,12 +150,29 @@ class _Member:
         self.transaction_particulars = None
         self.ref_no = None
         self.remarks_1 = None
+        self.split_parent_external_ref = split_parent
+        self.payment_count = None
         self.keys = keys
 
 
 class _Lot:
-    def __init__(self, lot_id):
+    def __init__(self, lot_id, bucket_kind="PAIR"):
         self.lot_id = lot_id
+        self.bucket_kind = bucket_kind
+        self.bucket_pacs008 = "PACS1"
+        self.bucket_msgid = "MSGA"
+        self.bucket_po = ""
+        self.bucket_ref = ""
+
+    def model_dump(self):
+        return {
+            "lot_id": self.lot_id,
+            "bucket_kind": self.bucket_kind,
+            "bucket_pacs008": self.bucket_pacs008,
+            "bucket_msgid": self.bucket_msgid,
+            "bucket_po": self.bucket_po,
+            "bucket_ref": self.bucket_ref,
+        }
 
 
 @pytest.fixture()
@@ -185,7 +185,7 @@ def captured(monkeypatch):
     seen = {"stored_currencies": {}}
 
     monkeypatch.setattr(
-        movement_lot_repository, "create_lots", lambda db, **kw: len(kw["lot_ids"])
+        movement_lot_repository, "create_lots", lambda db, **kw: len(kw["buckets"])
     )
     monkeypatch.setattr(
         movement_lot_repository,
@@ -198,6 +198,7 @@ def captured(monkeypatch):
 
     def _upsert(db, rows):
         # member_id = position, enough to build the key rows.
+        seen["member_rows"] = rows
         return len(rows), 0, {r["source_hash"]: i for i, r in enumerate(rows)}
 
     monkeypatch.setattr(movement_lot_repository, "upsert_members", _upsert)
@@ -213,11 +214,10 @@ def captured(monkeypatch):
 
     monkeypatch.setattr(movement_lot_repository, "sync_lot_currencies", _sync)
 
-    def _guard(db, *, flow_source_id, keys=None, limit=5):
-        seen["guard_keys"] = keys
-        return []
+    def _sync_synthetic(db, *, lot_ids):
+        seen["synthetic_lot_ids"] = set(lot_ids)
 
-    monkeypatch.setattr(movement_lot_repository, "find_cross_lot_conflicts", _guard)
+    monkeypatch.setattr(movement_lot_repository, "sync_synthetic_only", _sync_synthetic)
     return seen
 
 
@@ -235,7 +235,6 @@ def test_currency_rollup_skips_lots_that_already_match(captured):
         flow=_Flow(),
         source=_Source(),
         lots=[],
-        merges=[],
         members=[
             _Member(settled, "TX1", [_Key("PO", "po-1")], currency="EUR"),
             _Member(moving, "TX2", [_Key("PACS008", "pacs-1")], currency="USD"),
@@ -243,8 +242,10 @@ def test_currency_rollup_skips_lots_that_already_match(captured):
     )
 
     assert captured["currency_lot_ids"] == {moving}
-    # The guard still sees both members' keys.
-    assert sorted(captured["guard_keys"]) == [("PACS008", "pacs-1"), ("PO", "po-1")]
+    # The synthetic rollup, however, must see every lot the batch touched: a
+    # previously all-ghost bucket that just received a real movement has to lose
+    # the flag.
+    assert captured["synthetic_lot_ids"] == {settled, moving}
 
 
 def test_currency_rollup_still_runs_for_a_lot_declared_in_an_earlier_batch(captured):
@@ -260,16 +261,15 @@ def test_currency_rollup_still_runs_for_a_lot_declared_in_an_earlier_batch(captu
         flow=_Flow(),
         source=_Source(),
         lots=[],  # declared by an earlier batch
-        merges=[],
         members=[_Member(lot_id, "TX1", [_Key("PO", "po-1")], currency="GBP")],
     )
 
     assert captured["currency_lot_ids"] == {lot_id}
 
 
-def test_guard_sees_every_key_of_a_reclustered_member(captured):
-    """A member moving lots carries its WHOLE key set, not just the new key —
-    that is what makes scoping the guard to the batch's keys safe."""
+def test_member_keys_are_all_written(captured):
+    """A member's whole key set reaches movement_lot_key — it is what the deep
+    search and the key drawer navigate."""
     db = _FakeSession()
     lot_id = "33333333-3333-4333-8333-333333333333"
 
@@ -278,7 +278,6 @@ def test_guard_sees_every_key_of_a_reclustered_member(captured):
         flow=_Flow(),
         source=_Source(),
         lots=[_Lot(lot_id)],
-        merges=[],
         members=[
             _Member(
                 lot_id,
@@ -288,8 +287,38 @@ def test_guard_sees_every_key_of_a_reclustered_member(captured):
         ],
     )
 
-    assert sorted(captured["guard_keys"]) == [
+    assert sorted((r["key_type"], r["key_value"]) for r in captured["key_rows"]) == [
         ("MSGID", "msg-1"),
         ("PACS008", "pacs-1"),
         ("PO", "po-1"),
     ]
+
+
+def test_ghost_members_carry_a_derived_parent_hash(captured):
+    """The DAG cannot hash anything, so it sends the parent's external_ref and
+    the service derives the hash with the SAME formula split_service used when
+    it registered the parent — otherwise a ghost would point at nothing."""
+    db = _FakeSession()
+    lot_id = "55555555-5555-4555-8555-555555555555"
+
+    lot_service.apply_lot_batch(
+        db,
+        flow=_Flow(),
+        source=_Source(),
+        lots=[_Lot(lot_id)],
+        members=[
+            _Member(lot_id, "TX1~aaaa", [_Key("PO", "po-1")], split_parent="TX1"),
+            _Member(lot_id, "TX2", [_Key("PO", "po-2")]),  # a real movement
+        ],
+    )
+
+    rows = captured["member_rows"]
+    ghost = next(r for r in rows if r["external_ref"] == "TX1~aaaa")
+    real = next(r for r in rows if r["external_ref"] == "TX2")
+    assert real["split_parent_hash"] is None
+    assert ghost["split_parent_hash"] == lot_service.member_to_source_hash(
+        flow_id=_Flow.id, external_ref="TX1", account="0010130015001",
+        value_date=NOW, operation_date=NOW,
+    )
+    # It is the PARENT's hash, not the ghost's own.
+    assert ghost["split_parent_hash"] != ghost["source_hash"]

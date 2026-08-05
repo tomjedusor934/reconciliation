@@ -4,7 +4,7 @@ from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Dict, List, Optional, Sequence, Tuple
 
-from sqlalchemy import and_, exists, func, literal_column, or_, text
+from sqlalchemy import and_, case, exists, func, literal_column, or_, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
@@ -95,6 +95,12 @@ class ReconciliationEntryRepository:
         are immutable → skipped. Returns ``(inserted, updated, skipped)``.
         Relies on the finacle source_hash being reco_id-independent so that the
         same movement maps to a stable row across runs.
+
+        A real movement's ``amount`` is part of its identity and is never
+        updated. A batch-booking GHOST's is not: it is the sum of its bucket's
+        ``std.Payment`` amounts, which grows as the datamart fills in, so
+        ``amount``/``direction`` are refreshed for rows carrying a
+        ``split_parent_hash`` and left frozen for everything else.
         """
         if not rows:
             return 0, 0, 0
@@ -129,6 +135,7 @@ class ReconciliationEntryRepository:
             self._trace_conflicts(db, rows)
 
         stmt = pg_insert(ReconciliationEntry.__table__).values(rows)
+        is_ghost = stmt.excluded.split_parent_hash.isnot(None)
         stmt = stmt.on_conflict_do_update(
             index_elements=["source_hash"],
             set_={
@@ -139,6 +146,15 @@ class ReconciliationEntryRepository:
                 "transaction_id": stmt.excluded.transaction_id,
                 "payload_raw": stmt.excluded.payload_raw,
                 "ingestion_run_id": stmt.excluded.ingestion_run_id,
+                "split_parent_hash": stmt.excluded.split_parent_hash,
+                "amount": case(
+                    (is_ghost, stmt.excluded.amount),
+                    else_=ReconciliationEntry.__table__.c.amount,
+                ),
+                "direction": case(
+                    (is_ghost, stmt.excluded.direction),
+                    else_=ReconciliationEntry.__table__.c.direction,
+                ),
             },
             # Never touch a non-pending row (excluded entries linger in the live
             # table until swept; matched/forced have already left it).
@@ -794,14 +810,14 @@ class ReconciliationEntryRepository:
                 id, flow_id, ingestion_run_id, reco_id, account, currency, amount,
                 direction, value_date, operation_date, event_type, external_ref,
                 file_name, transaction_particulars, ref_no, remarks_1, transaction_id,
-                payload_raw, source_hash, status, match_group_id, matched_at,
-                emarged_at, created_at, updated_at
+                payload_raw, source_hash, split_parent_hash, status, match_group_id,
+                matched_at, emarged_at, created_at, updated_at
             )
             SELECT id, flow_id, ingestion_run_id, reco_id, account, currency, amount,
                    direction, value_date, operation_date, event_type, external_ref,
                    file_name, transaction_particulars, ref_no, remarks_1, transaction_id,
-                   payload_raw, source_hash, status, match_group_id, matched_at,
-                   :now, created_at, updated_at
+                   payload_raw, source_hash, split_parent_hash, status, match_group_id,
+                   matched_at, :now, created_at, updated_at
             FROM moved
             ON CONFLICT (source_hash) DO NOTHING
         """)
@@ -833,14 +849,14 @@ class ReconciliationEntryRepository:
                 id, flow_id, ingestion_run_id, reco_id, account, currency, amount,
                 direction, value_date, operation_date, event_type, external_ref,
                 file_name, transaction_particulars, ref_no, remarks_1, transaction_id,
-                payload_raw, source_hash, status, match_group_id, matched_at,
-                emarged_at, created_at, updated_at
+                payload_raw, source_hash, split_parent_hash, status, match_group_id,
+                matched_at, emarged_at, created_at, updated_at
             )
             SELECT id, flow_id, ingestion_run_id, reco_id, account, currency, amount,
                    direction, value_date, operation_date, event_type, external_ref,
                    file_name, transaction_particulars, ref_no, remarks_1, transaction_id,
-                   payload_raw, source_hash, status, match_group_id, matched_at,
-                   :now, created_at, updated_at
+                   payload_raw, source_hash, split_parent_hash, status, match_group_id,
+                   matched_at, :now, created_at, updated_at
             FROM moved
             ON CONFLICT (source_hash) DO NOTHING
         """)
@@ -872,13 +888,13 @@ class ReconciliationEntryRepository:
                 id, flow_id, ingestion_run_id, reco_id, account, currency, amount,
                 direction, value_date, operation_date, event_type, external_ref,
                 file_name, transaction_particulars, ref_no, remarks_1, transaction_id,
-                payload_raw, source_hash, status, match_group_id, matched_at,
-                created_at, updated_at
+                payload_raw, source_hash, split_parent_hash, status, match_group_id,
+                matched_at, created_at, updated_at
             )
             SELECT id, flow_id, ingestion_run_id, reco_id, account, currency, amount,
                    direction, value_date, operation_date, event_type, external_ref,
                    file_name, transaction_particulars, ref_no, remarks_1, transaction_id,
-                   payload_raw, source_hash, 'PENDING',
+                   payload_raw, source_hash, split_parent_hash, 'PENDING',
                    NULL, NULL,
                    created_at, :now
             FROM moved

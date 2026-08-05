@@ -44,14 +44,14 @@ class EmargementService:
                 id, flow_id, ingestion_run_id, reco_id, account, currency, amount,
                 direction, value_date, operation_date, event_type, external_ref,
                 file_name, transaction_particulars, ref_no, remarks_1, transaction_id,
-                payload_raw, source_hash, status, match_group_id, matched_at,
-                emarged_at, created_at, updated_at
+                payload_raw, source_hash, split_parent_hash, status, match_group_id,
+                matched_at, emarged_at, created_at, updated_at
             )
             SELECT id, flow_id, ingestion_run_id, reco_id, account, currency, amount,
                    direction, value_date, operation_date, event_type, external_ref,
                    file_name, transaction_particulars, ref_no, remarks_1, transaction_id,
-                   payload_raw, source_hash, status, match_group_id, matched_at,
-                   now(), created_at, updated_at
+                   payload_raw, source_hash, split_parent_hash, status, match_group_id,
+                   matched_at, now(), created_at, updated_at
             FROM moved
             ON CONFLICT (source_hash) DO NOTHING
         """)

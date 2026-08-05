@@ -107,8 +107,8 @@ def _ingest_finacle(**context):
 
 
 def _ingest_finacle_bb(**context):
-    """Datamart extraction for BATCH BOOKING TRUE finacle sources (lot
-    clustering — shared with the dedicated ingest_finacle_bb DAG).
+    """Datamart extraction for BATCH BOOKING TRUE finacle sources ((PACS008 ×
+    MSGID) bucketing — shared with the dedicated ingest_finacle_bb DAG).
 
     Skips gracefully if no MSSQL ODBC driver is available; a missing BB source
     is already a clean no-op inside run_finacle_bb_ingestion.

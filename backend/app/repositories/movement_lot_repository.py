@@ -1,31 +1,32 @@
 """Data access for movement lots (Finacle Batch Booking True).
 
 Write methods NEVER commit — ``lot_service.apply_lot_batch`` owns the
-transaction so a whole DAG batch (lots + merges + members + keys) is atomic
-and the cross-lot-key guard can roll everything back.
+transaction so a whole DAG batch (lots + members + keys) is atomic.
+
+A lot is a (PACS008 × MSGID) bucket whose id is a uuid5 of its identity, so the
+DAG can name it without asking the backend anything. That retired three pieces
+of machinery this module used to carry: ``get_key_map`` (reading every key back
+each run — the scaling wall), ``apply_merge`` (absorbing one lot into another
+when a new movement bridged two clusters) and ``find_cross_lot_conflicts`` (the
+guard that caught clustering against a stale key map). None of them have an
+equivalent here: the same bucket always yields the same uuid.
 
 Raw-SQL notes: entry statuses are compared against the enum NAMES
 ('PENDING', 'MATCHED', ...) — that is what ORM-written rows store.
 """
 import logging
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from sqlalchemy import literal_column, text
+from sqlalchemy import case, literal_column, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
 from app.models.movement_lot import (
     LOT_STATUS_ACTIVE,
-    LOT_STATUS_MERGED,
     MovementLot,
     MovementLotKey,
     MovementLotMember,
-)
-from app.models.reconciliation_entry import (
-    EntryStatus,
-    ReconciliationEntry,
-    ReconciliationEntryEmargement,
 )
 
 logger = logging.getLogger(__name__)
@@ -53,121 +54,51 @@ class MovementLotRepository:
     # DAG-facing writes (no commit — the service owns the transaction)
     # ------------------------------------------------------------------
 
-    def get_key_map(self, db: Session, *, flow_source_id: int) -> List[Any]:
-        """Every key of every ACTIVE lot of the source → (key_type, key_value,
-        lot_id, lot_created_at). Merged lots' members were moved to their
-        survivor, so the map always points at active lots."""
-        return db.execute(
-            text(
-                """
-                SELECT DISTINCT k.key_type, k.key_value, m.lot_id, l.created_at AS lot_created_at
-                FROM reco.movement_lot_key k
-                JOIN reco.movement_lot_member m ON m.id = k.member_id
-                JOIN reco.movement_lot l ON l.id = m.lot_id
-                WHERE l.flow_source_id = :fsid AND l.status = :active
-                """
-            ),
-            {"fsid": flow_source_id, "active": LOT_STATUS_ACTIVE},
-        ).fetchall()
-
     def create_lots(
-        self, db: Session, *, flow_id: int, flow_source_id: int, lot_ids: Sequence[str]
+        self, db: Session, *, flow_id: int, flow_source_id: int, buckets: Sequence[dict]
     ) -> int:
-        """Idempotent lot creation (a re-pushed batch after a crash is a no-op)."""
-        if not lot_ids:
+        """Idempotent bucket creation (a re-pushed batch after a crash is a no-op).
+
+        ``buckets`` carries ``lot_id`` plus the identity the uuid5 was derived
+        from, so the row records what it stands for and not just an opaque id.
+        """
+        if not buckets:
             return 0
-        rows = [
-            {
-                "id": lot_id,
+        rows = {
+            b["lot_id"]: {
+                "id": b["lot_id"],
                 "flow_id": flow_id,
                 "flow_source_id": flow_source_id,
                 "currency": "EUR",
                 "status": LOT_STATUS_ACTIVE,
                 "merge_conflict": False,
+                "bucket_kind": b["bucket_kind"],
+                "bucket_pacs008": b.get("bucket_pacs008") or "",
+                "bucket_msgid": b.get("bucket_msgid") or "",
+                "bucket_po": b.get("bucket_po") or "",
+                "bucket_ref": b.get("bucket_ref") or "",
             }
-            for lot_id in dict.fromkeys(lot_ids)
-        ]
-        stmt = pg_insert(MovementLot.__table__).values(rows).on_conflict_do_nothing(
-            index_elements=["id"]
-        )
+            for b in buckets
+        }
+        stmt = pg_insert(MovementLot.__table__).values(list(rows.values()))
+        stmt = stmt.on_conflict_do_nothing(index_elements=["id"])
         result = db.execute(stmt)
         return result.rowcount or 0
 
-    def apply_merge(
-        self, db: Session, *, absorbed_id: str, surviving_id: str, flow_source_id: int
-    ) -> Dict[str, Any]:
-        """Absorb one lot into another: move members, relink live PENDING
-        entries (targeted UPDATE — never a re-push), flag the survivor when the
-        absorbed lot already had emarged entries (they keep the old reco_id)."""
-        lots = {
-            lot.id: lot
-            for lot in db.query(MovementLot)
-            .filter(MovementLot.id.in_([absorbed_id, surviving_id]))
-            .with_for_update()
-            .all()
-        }
-        absorbed = lots.get(absorbed_id)
-        surviving = lots.get(surviving_id)
-        if absorbed is None or surviving is None:
-            raise ValueError(f"merge references unknown lot(s): {absorbed_id} -> {surviving_id}")
-        if absorbed.flow_source_id != flow_source_id or surviving.flow_source_id != flow_source_id:
-            raise ValueError(f"merge {absorbed_id} -> {surviving_id} crosses flow sources")
-        if absorbed.status == LOT_STATUS_MERGED:
-            return {"members_moved": 0, "entries_relinked": 0, "skipped": True}
-        # Defensive: a survivor absorbed by an earlier (out-of-band) merge —
-        # follow the chain to the terminal lot.
-        seen = set()
-        while surviving.status == LOT_STATUS_MERGED and surviving.merged_into_lot_id:
-            if surviving.id in seen:
-                raise ValueError(f"merge chain cycle at lot {surviving.id}")
-            seen.add(surviving.id)
-            surviving = db.query(MovementLot).filter(
-                MovementLot.id == surviving.merged_into_lot_id
-            ).with_for_update().one()
-
-        members_moved = (
-            db.query(MovementLotMember)
-            .filter(MovementLotMember.lot_id == absorbed.id)
-            .update({"lot_id": surviving.id}, synchronize_session=False)
-        )
-        entries_relinked = (
-            db.query(ReconciliationEntry)
-            .filter(
-                ReconciliationEntry.reco_id == absorbed.id,
-                ReconciliationEntry.status == EntryStatus.PENDING,
-            )
-            .update({"reco_id": surviving.id}, synchronize_session=False)
-        )
-        emarged = (
-            db.query(ReconciliationEntryEmargement.id)
-            .filter(ReconciliationEntryEmargement.reco_id == absorbed.id)
-            .limit(1)
-            .first()
-        )
-        if emarged is not None:
-            surviving.merge_conflict = True
-            logger.warning(
-                "[movement_lot] merge %s -> %s: absorbed lot has emarged entries "
-                "keeping the old reco_id (merge_conflict flagged)",
-                absorbed.id, surviving.id,
-            )
-        absorbed.status = LOT_STATUS_MERGED
-        absorbed.merged_into_lot_id = surviving.id
-        absorbed.merged_at = datetime.now(timezone.utc)
-        return {
-            "members_moved": members_moved,
-            "entries_relinked": entries_relinked,
-            "surviving_id": surviving.id,
-        }
-
     def upsert_members(self, db: Session, rows: Sequence[dict]) -> Tuple[int, int, Dict[str, int]]:
-        """Insert/refresh members keyed on source_hash. Amount/dates are part of
-        the identity (immutable after insert, like the entry upsert); lot_id and
-        the movement context follow re-clustering. Returns
-        (inserted, updated, {source_hash: member_id})."""
+        """Insert/refresh members keyed on source_hash.
+
+        A real movement's amount and dates are its identity and stay immutable
+        after insert (same rule as the entry upsert). A GHOST's is not: its
+        amount is the sum of its bucket's payments, which grows as std.Payment
+        fills in — so ``amount``/``direction`` are refreshed for rows carrying a
+        ``split_parent_hash``, and left alone for everything else.
+        Returns (inserted, updated, {source_hash: member_id}).
+        """
         if not rows:
             return 0, 0, {}
         stmt = pg_insert(MovementLotMember.__table__).values(list(rows))
+        ghost = stmt.excluded.split_parent_hash.isnot(None)
         stmt = stmt.on_conflict_do_update(
             index_elements=["source_hash"],
             set_={
@@ -176,6 +107,16 @@ class MovementLotRepository:
                 "transaction_particulars": stmt.excluded.transaction_particulars,
                 "ref_no": stmt.excluded.ref_no,
                 "remarks_1": stmt.excluded.remarks_1,
+                "split_parent_hash": stmt.excluded.split_parent_hash,
+                "payment_count": stmt.excluded.payment_count,
+                "amount": case(
+                    (ghost, stmt.excluded.amount),
+                    else_=MovementLotMember.__table__.c.amount,
+                ),
+                "direction": case(
+                    (ghost, stmt.excluded.direction),
+                    else_=MovementLotMember.__table__.c.direction,
+                ),
                 "updated_at": text("now()"),
             },
         ).returning(
@@ -233,86 +174,33 @@ class MovementLotRepository:
             {"lot_ids": list(lot_ids)},
         )
 
-    def find_cross_lot_conflicts(
-        self,
-        db: Session,
-        *,
-        flow_source_id: int,
-        keys: Optional[Sequence[Tuple[str, str]]] = None,
-        limit: int = 5,
-    ) -> List[Any]:
-        """Integrity guard: a key attached (via members) to more than one ACTIVE
-        lot means the DAG clustered against a stale key map — the batch must be
-        rolled back and the run retried.
+    def sync_synthetic_only(self, db: Session, *, lot_ids: Sequence[str]) -> None:
+        """Flag the buckets whose every member is a ghost.
 
-        ``keys`` restricts the check to the (key_type, key_value) pairs a batch
-        just wrote, which is what apply_lot_batch passes. That is not a weaker
-        check, it is the same check done where a conflict can actually appear:
-
-        * a batch can only attach a key to a new lot through the keys it writes,
-          and key_specs carries a re-clustered member's WHOLE key set, not just
-          its new keys — so a member moving lots is fully covered;
-        * a merge only ever moves members INTO a survivor, which can lower a
-          key's distinct-lot count but never raise it;
-        * every earlier batch ran this same guard over its own keys, so anything
-          it could have introduced was already caught (and rolled back).
-
-        Without ``keys`` the aggregate spans the entire source: a full scan of
-        movement_lot_key joined to every member and lot, with the LIMIT applied
-        only AFTER the hash aggregate. That form is fine as a one-off audit but
-        costs O(batches x source_keys) — quadratic — when run per batch. Keep it
-        for whole-source verification only.
+        Both sides of such a bucket are derived from the same std.Payment
+        amounts, so it nets to zero by construction and its 'matched' state
+        proves nothing on its own — the evidence is the parent-level
+        conservation in ``movement_split``. The UI surfaces the distinction; the
+        matching engine deliberately does not care.
         """
-        scoped = keys is not None
-        if scoped and not keys:
-            return []
-
-        source_filter = "WHERE l.flow_source_id = :fsid AND l.status = :active"
-        params: Dict[str, Any] = {
-            "fsid": flow_source_id,
-            "active": LOT_STATUS_ACTIVE,
-            "limit": limit,
-        }
-        if scoped:
-            # Driving from the batch's keys turns the scan into an index lookup
-            # on ix_movement_lot_key_value (key_type, key_value).
-            driver = """
-                WITH batch_keys AS (
-                    SELECT DISTINCT kt, kv
-                    FROM unnest(
-                        CAST(:key_types AS text[]), CAST(:key_values AS text[])
-                    ) AS t(kt, kv)
-                )
-                SELECT k.key_type, k.key_value, COUNT(DISTINCT m.lot_id) AS lot_count
-                FROM batch_keys bk
-                JOIN reco.movement_lot_key k
-                  ON k.key_type = bk.kt AND k.key_value = bk.kv
-                JOIN reco.movement_lot_member m ON m.id = k.member_id
-                JOIN reco.movement_lot l ON l.id = m.lot_id
-            """
-            deduped = sorted({(kt, kv) for kt, kv in keys})
-            params["key_types"] = [kt for kt, _ in deduped]
-            params["key_values"] = [kv for _, kv in deduped]
-        else:
-            driver = """
-                SELECT k.key_type, k.key_value, COUNT(DISTINCT m.lot_id) AS lot_count
-                FROM reco.movement_lot_key k
-                JOIN reco.movement_lot_member m ON m.id = k.member_id
-                JOIN reco.movement_lot l ON l.id = m.lot_id
-            """
-
-        return db.execute(
+        if not lot_ids:
+            return
+        db.execute(
             text(
-                f"""
-                {driver}
-                {source_filter}
-                GROUP BY k.key_type, k.key_value
-                HAVING COUNT(DISTINCT m.lot_id) > 1
-                LIMIT :limit
+                """
+                UPDATE reco.movement_lot l
+                SET synthetic_only = agg.all_ghosts
+                FROM (
+                    SELECT lot_id, BOOL_AND(split_parent_hash IS NOT NULL) AS all_ghosts
+                    FROM reco.movement_lot_member
+                    WHERE lot_id = ANY(:lot_ids)
+                    GROUP BY lot_id
+                ) agg
+                WHERE agg.lot_id = l.id AND l.synthetic_only IS DISTINCT FROM agg.all_ghosts
                 """
             ),
-            params,
-        ).fetchall()
+            {"lot_ids": list(lot_ids)},
+        )
 
     def lot_currencies(self, db: Session, *, lot_ids: Sequence[str]) -> Dict[str, str]:
         """{lot_id: currency} for the ids that exist — existence check and stored
@@ -339,6 +227,8 @@ class MovementLotRepository:
     _LOT_SELECT = f"""
         SELECT l.id, l.flow_id, l.flow_source_id, l.currency, l.status AS lot_status,
                l.merged_into_lot_id, l.merged_at, l.merge_conflict, l.created_at, l.updated_at,
+               l.bucket_kind, l.bucket_pacs008, l.bucket_msgid, l.bucket_po, l.bucket_ref,
+               l.synthetic_only,
                COALESCE(agg.member_count, 0) AS member_count,
                COALESCE(agg.total_debit, 0) AS total_debit,
                COALESCE(agg.total_credit, 0) AS total_credit,
@@ -401,6 +291,9 @@ class MovementLotRepository:
         date_to: Optional[datetime],
         search: Optional[str],
         lot_id: Optional[str] = None,
+        bucket_kind: Optional[str] = None,
+        synthetic_only: Optional[bool] = None,
+        payment_gap: Optional[bool] = None,
     ) -> Tuple[str, Dict[str, Any]]:
         """(outer WHERE clause over the aggregated subquery, bind params)."""
         clauses: List[str] = []
@@ -411,6 +304,23 @@ class MovementLotRepository:
         if flow_id is not None:
             clauses.append("flow_id = :flow_id")
             params["flow_id"] = flow_id
+        if bucket_kind:
+            clauses.append("bucket_kind = :bucket_kind")
+            params["bucket_kind"] = bucket_kind
+        if synthetic_only is not None:
+            clauses.append("synthetic_only = :synthetic_only")
+            params["synthetic_only"] = synthetic_only
+        if payment_gap is not None:
+            # Lots holding a ghost whose movement's booked amount disagrees with
+            # what std.Payment accounts for. Scoped through the lot's own members
+            # (index on movement_lot_member.lot_id, then a PK probe per ghost),
+            # same shape as the key EXISTS below.
+            exists = (
+                "EXISTS (SELECT 1 FROM reco.movement_lot_member gm"
+                " JOIN reco.movement_split gs ON gs.source_hash = gm.split_parent_hash"
+                " WHERE gm.lot_id = lot_agg.id AND gs.amount <> gs.payment_amount)"
+            )
+            clauses.append(exists if payment_gap else f"NOT {exists}")
         if status == "merged":
             clauses.append("lot_status = 'merged'")
         elif status == "matched":
@@ -450,12 +360,17 @@ class MovementLotRepository:
         date_from: Optional[datetime] = None,
         date_to: Optional[datetime] = None,
         search: Optional[str] = None,
+        bucket_kind: Optional[str] = None,
+        synthetic_only: Optional[bool] = None,
+        payment_gap: Optional[bool] = None,
         skip: int = 0,
         limit: int = 50,
     ) -> Tuple[List[Any], int]:
         where, params = self._lot_filters(
             flow_id=flow_id, status=status, balanced=balanced,
             date_from=date_from, date_to=date_to, search=search,
+            bucket_kind=bucket_kind, synthetic_only=synthetic_only,
+            payment_gap=payment_gap,
         )
         base = f"SELECT * FROM ({self._LOT_SELECT}) AS lot_agg{where}"
         total = db.execute(
@@ -486,12 +401,18 @@ class MovementLotRepository:
                m.account, m.currency, m.amount, m.direction,
                m.value_date, m.operation_date,
                m.transaction_particulars, m.ref_no, m.remarks_1,
+               m.split_parent_hash, m.payment_count,
+               sp.external_ref AS split_parent_external_ref,
+               sp.amount AS split_parent_amount,
                COALESCE(le.status::text, ee.status::text) AS entry_status,
                COALESCE(le.id, ee.id) AS entry_id,
                COALESCE(le.match_group_id, ee.match_group_id) AS match_group_id
         FROM reco.movement_lot_member m
         LEFT JOIN reco.reconciliation_entry le ON le.source_hash = m.source_hash
         LEFT JOIN reco.reconciliation_entry_emargement ee ON ee.source_hash = m.source_hash
+        -- Ghosts only (split_parent_hash IS NULL for a real movement, so this
+        -- costs a PK probe per ghost and nothing at all for the rest).
+        LEFT JOIN reco.movement_split sp ON sp.source_hash = m.split_parent_hash
         WHERE m.lot_id = :lot_id
     """
 

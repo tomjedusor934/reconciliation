@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { computed } from 'vue';
 import { Handle, Position } from '@vue-flow/core';
+import { Layers } from 'lucide-vue-next';
 import Badge from '@/components/ui/Badge.vue';
 import { formatAmount } from '@/utils/formatAmount';
 import { formatDateShort } from '@/utils/formatDate';
@@ -8,8 +9,13 @@ import type { MovementNodeData } from '@/utils/lotGraph';
 
 const props = defineProps<{ data: MovementNodeData }>();
 
+const emit = defineEmits<{ (e: 'open-split', parentHash: string): void }>();
+
 const member = computed(() => props.data.member);
 const isDebit = computed(() => Number(member.value.amount) < 0);
+// A ghost is a slice of a real movement, not a booking of its own — drawn
+// dashed so it never reads as money that actually moved on its own.
+const ghostOf = computed(() => member.value.split_parent_hash || null);
 
 const TYPE_CLASSES: Record<string, string> = {
   SCTXB: 'bg-indigo-100 text-indigo-800',
@@ -36,7 +42,10 @@ const reference = computed(
 </script>
 
 <template>
-  <div class="w-[300px] rounded-lg border border-gray-200 bg-white shadow-sm px-3 py-2">
+  <div
+    class="w-[300px] rounded-lg bg-white shadow-sm px-3 py-2"
+    :class="ghostOf ? 'border-2 border-dashed border-indigo-300' : 'border border-gray-200'"
+  >
     <div class="flex items-center justify-between gap-2">
       <span
         class="inline-flex items-center rounded-full px-2 py-0.5 text-xs font-semibold"
@@ -55,6 +64,19 @@ const reference = computed(
       <span>{{ formatDateShort(member.value_date) }}</span>
       <span class="font-mono truncate max-w-[160px]" :title="reference">{{ reference }}</span>
     </div>
+    <button
+      v-if="ghostOf"
+      type="button"
+      class="mt-1.5 flex w-full items-center gap-1.5 rounded-md bg-indigo-50 px-2 py-1 text-left text-[11px] text-indigo-700 transition-colors hover:bg-indigo-100"
+      :title="'Show the real movement this is a slice of'"
+      @click.stop="emit('open-split', ghostOf)"
+    >
+      <Layers class="h-3 w-3 shrink-0" />
+      <span class="truncate">
+        Slice of {{ member.split_parent_external_ref || 'a batch movement' }}
+        <template v-if="member.payment_count">· {{ member.payment_count }} payment(s)</template>
+      </span>
+    </button>
     <Handle
       type="source"
       :position="data.side === 'SP' ? Position.Right : Position.Left"

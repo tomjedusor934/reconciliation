@@ -45,6 +45,52 @@ _ADDED_COLUMNS = [
     # timestamp is deliberately WITHOUT TIME ZONE — see the model for why.
     ("reco.entry_payment_status", "amount", "NUMERIC(20, 4)"),
     ("reco.entry_payment_status", "payment_timestamp", "TIMESTAMP"),
+    # Batch-booking buckets (see MovementLot). Absent identity components are ''
+    # rather than NULL so uq_movement_lot_bucket actually bites.
+    ("reco.movement_lot", "bucket_kind", "VARCHAR(16) NOT NULL DEFAULT 'LEGACY'"),
+    ("reco.movement_lot", "bucket_pacs008", "VARCHAR(128) NOT NULL DEFAULT ''"),
+    ("reco.movement_lot", "bucket_msgid", "VARCHAR(128) NOT NULL DEFAULT ''"),
+    ("reco.movement_lot", "bucket_po", "VARCHAR(64) NOT NULL DEFAULT ''"),
+    ("reco.movement_lot", "bucket_ref", "VARCHAR(64) NOT NULL DEFAULT ''"),
+    ("reco.movement_lot", "synthetic_only", "BOOLEAN NOT NULL DEFAULT false"),
+    # Ghost -> real movement link (see MovementSplit).
+    ("reco.reconciliation_entry", "split_parent_hash", "VARCHAR(64)"),
+    ("reco.reconciliation_entry_emargement", "split_parent_hash", "VARCHAR(64)"),
+    ("reco.movement_lot_member", "split_parent_hash", "VARCHAR(64)"),
+    ("reco.movement_lot_member", "payment_count", "INTEGER"),
+    # What std.Payment says about a split movement, and how many movements share
+    # its aggregate key (see MovementSplit). The gap amount - payment_amount
+    # replaced the residual ghost.
+    ("reco.movement_split", "payment_amount", "NUMERIC(20, 4) NOT NULL DEFAULT 0"),
+    ("reco.movement_split", "shared_key_movements", "INTEGER NOT NULL DEFAULT 1"),
+]
+
+# Indexes on pre-existing tables — ``create_all`` only builds the ones declared
+# on a table it creates itself, so an index added to a deployed table lands here
+# (same reasoning as _ADDED_COLUMNS). Applied AFTER the column loop, and after
+# _backfill_legacy_lot_buckets for the ones that enforce uniqueness.
+_ADDED_INDEXES = [
+    (
+        "uq_movement_lot_bucket",
+        "CREATE UNIQUE INDEX IF NOT EXISTS uq_movement_lot_bucket "
+        "ON reco.movement_lot "
+        "(flow_source_id, bucket_kind, bucket_pacs008, bucket_msgid, bucket_po, bucket_ref)",
+    ),
+    (
+        "ix_reconciliation_entry_split_parent",
+        "CREATE INDEX IF NOT EXISTS ix_reconciliation_entry_split_parent "
+        "ON reco.reconciliation_entry (split_parent_hash)",
+    ),
+    (
+        "ix_emargement_split_parent",
+        "CREATE INDEX IF NOT EXISTS ix_emargement_split_parent "
+        "ON reco.reconciliation_entry_emargement (split_parent_hash)",
+    ),
+    (
+        "ix_movement_lot_member_split_parent",
+        "CREATE INDEX IF NOT EXISTS ix_movement_lot_member_split_parent "
+        "ON reco.movement_lot_member (split_parent_hash)",
+    ),
 ]
 
 # Columns removed from already-existing tables — same reasoning as _ADDED_COLUMNS
@@ -54,6 +100,9 @@ _DROPPED_COLUMNS = [
     # cannot carry the hour the operational filter needs. Never populated — the
     # table had just been rebuilt empty when it shipped.
     ("reco.entry_payment_status", "req_exec_date"),
+    # Superseded by payment_amount: the gap between std.Payment and the
+    # accounting is now data on the movement, not a residual ghost in a bucket.
+    ("reco.movement_split", "residual_amount"),
 ]
 
 
@@ -94,6 +143,27 @@ def _rebuild_legacy_entry_payment_status(db: Session) -> None:
     db.commit()
     EntryPaymentStatus.__table__.create(bind=db.get_bind(), checkfirst=True)
     db.commit()
+
+
+def _backfill_legacy_lot_buckets(db: Session) -> None:
+    """Give every pre-bucket lot a unique bucket identity before the constraint.
+
+    Lots built by the retired union-find clustering are not buckets: they have no
+    (pacs008, MessageID) pair to name them. They all default to kind 'LEGACY'
+    with empty components, which would collide under ``uq_movement_lot_bucket``.
+    Using their own id as ``bucket_ref`` keeps each one unique and marks them
+    plainly as inherited. Idempotent: only touches rows still at the default.
+    """
+    result = db.execute(
+        text(
+            "UPDATE reco.movement_lot SET bucket_kind = 'LEGACY', bucket_ref = id "
+            "WHERE bucket_kind = 'LEGACY' AND bucket_ref = ''"
+        )
+    )
+    if result.rowcount:
+        logger.info(
+            "[init_reco] %d pre-bucket movement_lot row(s) marked LEGACY", result.rowcount
+        )
 
 
 _AUDIT_TRIGGER_FN = """
@@ -209,3 +279,17 @@ def init_reco_db(db: Session) -> None:
             text(f'ALTER TABLE IF EXISTS {table} DROP COLUMN IF EXISTS "{column}"')
         )
     db.commit()
+
+    # 7. Data fixups the new columns require, then the indexes over them.
+    _backfill_legacy_lot_buckets(db)
+    db.commit()
+    for name, ddl in _ADDED_INDEXES:
+        try:
+            db.execute(text(ddl))
+            db.commit()
+        except Exception as exc:  # noqa: BLE001
+            # A duplicate bucket identity in legacy data must not stop the boot:
+            # the app reads fine without the constraint, and the ingest DAG is
+            # what would surface the real problem.
+            db.rollback()
+            logger.warning("[init_reco] could not create index %s: %s", name, exc)

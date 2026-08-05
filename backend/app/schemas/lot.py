@@ -28,6 +28,16 @@ class LotSummary(BaseModel):
     last_value_date: Optional[datetime] = None
     merge_conflict: bool = False
     merged_into_lot_id: Optional[str] = None
+    # What the bucket stands for. LEGACY = lot inherited from the retired
+    # union-find clustering, with no (pacs008, MessageID) identity to show.
+    bucket_kind: str = "LEGACY"
+    bucket_pacs008: Optional[str] = None
+    bucket_msgid: Optional[str] = None
+    bucket_po: Optional[str] = None
+    bucket_ref: Optional[str] = None
+    # Every member is a ghost → the lot nets to zero by construction; the real
+    # evidence is the parent conservation in GET /splits/{parent_source_hash}.
+    synthetic_only: bool = False
     created_at: datetime
     updated_at: datetime
 
@@ -51,6 +61,11 @@ class LotMemberOut(BaseModel):
     transaction_particulars: Optional[str] = None
     ref_no: Optional[str] = None
     remarks_1: Optional[str] = None
+    # Set on ghosts: the real movement this member is a slice of.
+    split_parent_hash: Optional[str] = None
+    split_parent_external_ref: Optional[str] = None
+    split_parent_amount: Optional[Decimal] = None
+    payment_count: Optional[int] = None
     entry_status: Optional[str] = None  # pending|matched|forced|excluded|None (not ingested yet)
     entry_id: Optional[int] = None
     match_group_id: Optional[int] = None
@@ -131,12 +146,14 @@ class PaginatedLotKeyValuesResponse(BaseModel):
 # ── Internal (ingest_finacle_bb DAG) payloads ───────────────────────
 
 class LotIn(BaseModel):
+    """A bucket to create. ``lot_id`` is the uuid5 the DAG derived from the
+    identity below, so the identity is descriptive here, never re-derived."""
     lot_id: str = Field(min_length=1, max_length=36)
-
-
-class LotMergeIn(BaseModel):
-    absorbed_lot_id: str = Field(min_length=1, max_length=36)
-    surviving_lot_id: str = Field(min_length=1, max_length=36)
+    bucket_kind: str  # validated against movement_lot.BUCKET_KINDS in the service
+    bucket_pacs008: str = Field(default="", max_length=128)
+    bucket_msgid: str = Field(default="", max_length=128)
+    bucket_po: str = Field(default="", max_length=64)
+    bucket_ref: str = Field(default="", max_length=64)
 
 
 class LotKeyIn(BaseModel):
@@ -157,6 +174,11 @@ class LotMemberIn(BaseModel):
     transaction_particulars: Optional[str] = None
     ref_no: Optional[str] = None
     remarks_1: Optional[str] = None
+    # Ghosts only: the real movement's external_ref. The hash itself is derived
+    # backend-side (the DAG has no way to compute it) from this plus the account
+    # and dates — which a ghost shares with its parent, being the same movement.
+    split_parent_external_ref: Optional[str] = Field(default=None, max_length=128)
+    payment_count: Optional[int] = None
     keys: List[LotKeyIn] = Field(default_factory=list)
 
 
@@ -164,17 +186,4 @@ class LotBatchIn(BaseModel):
     flow_code: str
     source_code: str
     lots: List[LotIn] = Field(default_factory=list)
-    merges: List[LotMergeIn] = Field(default_factory=list)
     members: List[LotMemberIn] = Field(default_factory=list)
-
-
-class LotKeyMapItem(BaseModel):
-    key_type: str
-    key_value: str
-    lot_id: str
-    lot_created_at: datetime
-
-
-class LotKeyMapResponse(BaseModel):
-    ok: bool
-    keys: List[LotKeyMapItem]

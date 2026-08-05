@@ -36,6 +36,9 @@ def list_lots(
         date_from=filters.date_from,
         date_to=filters.date_to,
         search=filters.search,
+        bucket_kind=filters.bucket_kind,
+        synthetic_only=filters.synthetic_only,
+        payment_gap=filters.payment_gap,
         skip=skip,
         limit=limit,
     )

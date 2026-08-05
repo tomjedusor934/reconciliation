@@ -14,6 +14,7 @@ from .match_group import MatchMode as MatchMode
 from .movement_lot import MovementLot as MovementLot
 from .movement_lot import MovementLotKey as MovementLotKey
 from .movement_lot import MovementLotMember as MovementLotMember
+from .movement_split import MovementSplit as MovementSplit
 from .payment_bulk_key import PaymentBulkKey as PaymentBulkKey
 from .payment_status import EntryPaymentStatus as EntryPaymentStatus
 from .reconciliation_entry import EntryDirection as EntryDirection

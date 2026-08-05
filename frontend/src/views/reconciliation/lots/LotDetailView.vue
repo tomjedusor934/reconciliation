@@ -9,6 +9,7 @@ import Loader from '@/components/ui/Loader.vue';
 import LotGraph from '@/components/lots/LotGraph.vue';
 import LotGraphAggregate from '@/components/lots/LotGraphAggregate.vue';
 import LotKeyDrawer from '@/components/lots/LotKeyDrawer.vue';
+import SplitDrawer from '@/components/lots/SplitDrawer.vue';
 import LotMembersTable from '@/components/lots/LotMembersTable.vue';
 import type { LotGraphFocus } from '@/utils/lotAggregateGraph';
 import { formatAmount } from '@/utils/formatAmount';
@@ -35,9 +36,22 @@ const drawerOpen = ref(false);
 const drawerKeyType = ref<string | null>(null);
 const focus = ref<LotGraphFocus | null>(null);
 
+// Split drawer (click a ghost → the real movement it is a slice of).
+const splitHash = ref<string | null>(null);
+
 const lot = computed(() => detail.value?.lot ?? null);
 // Giant lots ship without inlined members: aggregate graph + paginated table.
 const isAggregate = computed(() => detail.value?.members_included === false);
+
+/** What the bucket stands for, e.g. "26070613550600068 × LUXEMBOURG". */
+const bucketLabel = computed(() => {
+  if (!lot.value || lot.value.bucket_kind === 'LEGACY') return null;
+  if (lot.value.bucket_kind === 'RESIDUAL') return 'Unexplained remainder of a split';
+  const parts = [lot.value.bucket_pacs008, lot.value.bucket_msgid, lot.value.bucket_po].filter(
+    Boolean
+  );
+  return parts.length ? parts.join(' × ') : null;
+});
 
 const typeCounts = computed<Record<string, number>>(() => {
   if (isAggregate.value) return graph.value?.meta.type_counts ?? {};
@@ -67,6 +81,7 @@ const fetchDetail = async () => {
   focus.value = null;
   drawerOpen.value = false;
   drawerKeyType.value = null;
+  splitHash.value = null;
   try {
     const { data } = await lotService.get(lotId);
     detail.value = data;
@@ -137,6 +152,17 @@ const openOperational = () => {
   });
 };
 
+// Click a ghost → the real movement it came from, and its sibling slices.
+const onOpenSplit = (parentHash: string) => {
+  splitHash.value = parentHash;
+};
+
+// Jump from a sibling slice to the bucket it settled in.
+const onOpenSplitLot = (lotId: string) => {
+  splitHash.value = null;
+  if (lotId !== lot.value?.lot_id) router.push(`/reconciliation/lots/${lotId}`);
+};
+
 const openSurvivor = () => {
   if (lot.value?.merged_into_lot_id) {
     router.push(`/reconciliation/lots/${lot.value.merged_into_lot_id}`);
@@ -154,7 +180,9 @@ onMounted(fetchDetail);
         <ArrowLeft class="h-4 w-4" />
       </Button>
       <h1 class="text-2xl font-bold text-space-indigo truncate" :title="lot?.lot_id">
-        Lot <span class="font-mono text-xl">{{ lot?.lot_id || route.params.id }}</span>
+        Lot
+        <span v-if="bucketLabel" class="font-mono text-xl">{{ bucketLabel }}</span>
+        <span v-else class="font-mono text-xl">{{ lot?.lot_id || route.params.id }}</span>
       </h1>
       <template v-if="lot">
         <Badge :variant="statusVariant">{{ lot.status }}</Badge>
@@ -162,6 +190,14 @@ onMounted(fetchDetail);
           {{ lot.is_balanced ? 'Balanced' : 'Unbalanced' }}
         </Badge>
         <Badge v-if="lot.currencies.length > 1" variant="danger">multi-currency</Badge>
+        <Badge v-if="lot.bucket_kind === 'RESIDUAL'" variant="danger">residual</Badge>
+        <Badge
+          v-if="lot.synthetic_only"
+          variant="info"
+          title="Every movement here is a slice of a batch, so the bucket nets to zero by construction — the real proof is each parent's conservation"
+        >
+          proven by construction
+        </Badge>
       </template>
     </div>
     <Button v-if="lot" variant="reveals-primary" @click="openOperational">
@@ -264,7 +300,12 @@ onMounted(fetchDetail);
         @clear-focus="onClearFocus"
       />
       <div v-else-if="isAggregate" class="flex justify-center py-10"><Loader size="lg" /></div>
-      <LotGraph v-else :members="detail.members" :keys="detail.keys" />
+      <LotGraph
+        v-else
+        :members="detail.members"
+        :keys="detail.keys"
+        @open-split="onOpenSplit"
+      />
     </div>
 
     <LotMembersTable
@@ -273,6 +314,7 @@ onMounted(fetchDetail);
       v-model:filter-type="filterType"
       v-model:filter-direction="filterDirection"
       v-model:filter-key="filterKey"
+      @open-split="onOpenSplit"
     />
 
     <LotKeyDrawer
@@ -282,6 +324,14 @@ onMounted(fetchDetail);
       :selected-value="filterKey?.key_value ?? null"
       @close="drawerOpen = false"
       @select-value="onDrawerSelectValue"
+    />
+
+    <SplitDrawer
+      :is-open="splitHash !== null"
+      :parent-hash="splitHash"
+      :current-lot-id="lot.lot_id"
+      @close="splitHash = null"
+      @open-lot="onOpenSplitLot"
     />
   </template>
 

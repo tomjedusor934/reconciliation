@@ -5,6 +5,7 @@ import type {
   PaginatedLotKeyValuesResponse,
   PaginatedLotMembersResponse,
   PaginatedLotsResponse,
+  SplitDetail,
 } from '@/types';
 
 const resource = '/lots';
@@ -16,6 +17,9 @@ export interface LotFilters {
   date_from?: string;
   date_to?: string;
   search?: string;
+  bucket_kind?: string;
+  synthetic_only?: boolean;
+  payment_gap?: boolean;
   skip?: number;
   limit?: number;
 }
@@ -58,5 +62,10 @@ export default {
   },
   getMembers(lotId: string, params: LotMemberFilters = {}) {
     return api.get<PaginatedLotMembersResponse>(`${resource}/${lotId}/members`, { params });
+  },
+  // The real movement behind a ghost, its sibling ghosts across every bucket,
+  // and whether the amounts still add back up to it.
+  getSplit(parentSourceHash: string) {
+    return api.get<SplitDetail>(`/splits/${parentSourceHash}`);
   },
 };

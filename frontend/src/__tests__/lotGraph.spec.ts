@@ -133,4 +133,26 @@ describe('buildLotGraph', () => {
     ]);
     expect(edges.length).toBe(keys.length);
   });
+
+  it('carries the split link through to the node, so ghosts can be told apart', () => {
+    // A ghost is a slice of a batch movement, not a booking of its own; the node
+    // renders it dashed and offers the way back to the real movement.
+    const ghost = member({
+      movement_type: 'SCTXB',
+      amount: '-700.00',
+      split_parent_hash: 'a'.repeat(64),
+      split_parent_external_ref: 'PF0051006#2',
+      split_parent_amount: '-1000.00',
+      payment_count: 2,
+    });
+    const real = member({ movement_type: 'NDGB', amount: '700.00' });
+    const { nodes } = buildLotGraph([ghost, real], [key(ghost.id, 'PACS008', 'PACS1')]);
+
+    const ghostNode = nodes.find((n) => n.id === `m-${ghost.id}`);
+    const realNode = nodes.find((n) => n.id === `m-${real.id}`);
+    expect((ghostNode!.data as any).member.split_parent_hash).toBe('a'.repeat(64));
+    expect((ghostNode!.data as any).member.split_parent_external_ref).toBe('PF0051006#2');
+    expect((ghostNode!.data as any).member.payment_count).toBe(2);
+    expect((realNode!.data as any).member.split_parent_hash).toBeUndefined();
+  });
 });

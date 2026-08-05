@@ -233,6 +233,11 @@ export interface MatchGroup {
 
 export type LotStatus = 'pending' | 'matched' | 'merged';
 export type LotKeyType = 'PACS008' | 'MSGID' | 'PO';
+// What a lot stands for. A lot IS a (PACS008 × MSGID) bucket; the degraded
+// kinds cover payments missing one side, RESIDUAL is legacy — it held what a
+// split could not
+// explain, and LEGACY marks the lots inherited from the retired clustering.
+export type BucketKind = 'PAIR' | 'PACS_ONLY' | 'MSGID_ONLY' | 'PO' | 'RESIDUAL' | 'LEGACY';
 
 export interface LotSummary {
   lot_id: string;
@@ -255,6 +260,14 @@ export interface LotSummary {
   last_value_date?: string | null;
   merge_conflict: boolean;
   merged_into_lot_id?: string | null;
+  bucket_kind: BucketKind;
+  bucket_pacs008?: string | null;
+  bucket_msgid?: string | null;
+  bucket_po?: string | null;
+  bucket_ref?: string | null;
+  // Every member is a ghost → the lot nets to zero by construction and proves
+  // nothing on its own; the evidence is the parent conservation in /splits.
+  synthetic_only: boolean;
   created_at: string;
   updated_at: string;
 }
@@ -273,6 +286,11 @@ export interface LotMember {
   transaction_particulars?: string | null;
   ref_no?: string | null;
   remarks_1?: string | null;
+  // Set on ghosts: the real movement this is a slice of.
+  split_parent_hash?: string | null;
+  split_parent_external_ref?: string | null;
+  split_parent_amount?: string | null;
+  payment_count?: number | null;
   entry_status?: EntryStatus | null;
   entry_id?: number | null;
   match_group_id?: number | null;
@@ -352,6 +370,70 @@ export interface LotKeyValue {
 export interface PaginatedLotKeyValuesResponse {
   items: LotKeyValue[];
   total_count: number;
+}
+
+// ── Movement splits (a real movement and the ghosts that replaced it) ───
+
+export interface SplitParent {
+  source_hash: string;
+  flow_id: number;
+  movement_type: string;
+  external_ref?: string | null;
+  account?: string | null;
+  currency: string;
+  amount: string; // signed, as booked by finacle
+  direction?: EntryDirection | null;
+  value_date: string;
+  operation_date?: string | null;
+  transaction_particulars?: string | null;
+  ref_no?: string | null;
+  remarks_1?: string | null;
+  payment_count: number;
+  // Above 1, several movements claim the same payment group (Finacle booked one
+  // batch as N entries): the allocation is weighted on a shared basis.
+  shared_key_movements: number;
+  // The real movement was already émargé and could not be withdrawn: its ghosts
+  // double count against it until an operator arbitrates.
+  parent_emarged: boolean;
+}
+
+export interface SplitChild {
+  entry_id?: number | null;
+  source_hash: string;
+  lot_id?: string | null;
+  amount: string;
+  currency: string;
+  direction?: EntryDirection | null;
+  value_date: string;
+  external_ref?: string | null;
+  entry_status?: EntryStatus | null;
+  match_group_id?: number | null;
+  payment_count?: number | null;
+  bucket_kind?: BucketKind | null;
+  bucket_pacs008?: string | null;
+  bucket_msgid?: string | null;
+  bucket_po?: string | null;
+  bucket_ref?: string | null;
+  synthetic_only: boolean;
+}
+
+// Two distinct controls, deliberately not mixed. Conservation: the ghosts share
+// out the movement's own amount, so missing_amount is 0 unless one was removed
+// out of band. Data quality: payment_gap is what finacle booked minus what
+// std.Payment accounts for — a signal about the datamart, never a hole.
+export interface SplitConservation {
+  parent_amount: string;
+  children_amount: string;
+  missing_amount: string;
+  payment_amount: string;
+  payment_gap: string;
+  child_count: number;
+}
+
+export interface SplitDetail {
+  parent: SplitParent;
+  children: SplitChild[];
+  conservation: SplitConservation;
 }
 
 export interface ForceMatchRequest {

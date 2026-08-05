@@ -40,6 +40,7 @@ from reco_datamart import (
     DATAMART_CONN_ID,
     INSTANT_PREFIXES,
     NDRT_PREFIX,
+    PAYMENT_AMOUNT_COL,
     _channel_id,
     _clean,
     _dm_ref_no,
@@ -68,22 +69,10 @@ PS_FULL_SYNC = os.environ.get("RECO_FINACLE_PS_FULL_SYNC", "").strip().lower() i
 PS_FETCH_BATCH = int(os.environ.get("RECO_FINACLE_PS_FETCH_BATCH", "2000"))
 PS_PUSH_BATCH = int(os.environ.get("RECO_FINACLE_PS_PUSH_BATCH", "2000"))
 
-# std.Payment amount column. Confirmed against the datamart = SettlementAmount
-# (std.Movement uses TransactionAmount; the two differ). Override with
-# RECO_FINACLE_PAYMENT_AMOUNT_COL if the datamart schema ever changes.
-PAYMENT_AMOUNT_COL = os.environ.get(
-    "RECO_FINACLE_PAYMENT_AMOUNT_COL", "SettlementAmount"
-).strip()
-
 # reco_id sentinel for movements whose schema isn't handled yet (mirrors
 # backend UNRESOLVED_RECO_ID). Such movements — and NULL/empty reco_id — are not
 # a real reconciliation group, so their payments are never keyed/pushed.
 UNRESOLVED_RECO_ID = "Not Supported"
-if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", PAYMENT_AMOUNT_COL):
-    raise ValueError(
-        f"RECO_FINACLE_PAYMENT_AMOUNT_COL must be a bare SQL identifier, "
-        f"got {PAYMENT_AMOUNT_COL!r}"
-    )
 
 # Finacle datamart parsers whose movements carry std.Payment references.
 _PS_PARSER_TYPES = (None, "finacle_db", "finacle_batch_booking_true")

@@ -14,8 +14,10 @@ from fastapi.testclient import TestClient
 
 from app.api.v1 import deps
 from app.api.v1.endpoints import lots as lots_endpoint
+from app.api.v1.endpoints import splits as splits_endpoint
 from app.api.v1.endpoints import tasks_lots as tasks_lots_endpoint
-from app.services.lot_service import CrossLotKeyConflict, lot_service
+from app.services.lot_service import lot_service
+from app.services.split_service import split_service
 
 NOW = datetime(2026, 7, 10, 12, 0, 0, tzinfo=timezone.utc)
 
@@ -38,6 +40,12 @@ LOT_SUMMARY = {
     "last_value_date": NOW,
     "merge_conflict": False,
     "merged_into_lot_id": None,
+    "bucket_kind": "PAIR",
+    "bucket_pacs008": "PACS1",
+    "bucket_msgid": "MSGA",
+    "bucket_po": None,
+    "bucket_ref": None,
+    "synthetic_only": False,
     "created_at": NOW,
     "updated_at": NOW,
 }
@@ -52,6 +60,7 @@ class _StubUser:
 def client():
     app = FastAPI()
     app.include_router(lots_endpoint.router, prefix="/lots")
+    app.include_router(splits_endpoint.router, prefix="/splits")
     app.include_router(tasks_lots_endpoint.router, prefix="/tasks")
     app.dependency_overrides[deps.get_db] = lambda: None
     app.dependency_overrides[deps.get_current_active_user] = lambda: _StubUser()
@@ -146,38 +155,40 @@ def test_get_lot_detail_giant_lot_flags_members_omitted(client, monkeypatch):
 
 GRAPH = {
     "lot_id": "11111111-1111-4111-8111-111111111111",
-    "keys": [
-        {"id": "PACS008:P1", "key_type": "PACS008", "key_value": "P1", "member_count": 51994}
+    "key_types": [
+        {"key_type": "PACS008", "distinct_count": 1, "member_link_count": 51994},
+        {"key_type": "MSGID", "distinct_count": 12, "member_link_count": 51990},
     ],
     "groups": [
         {
-            "id": "g0",
             "movement_type": "NDGB",
+            "direction": "credit",
             "member_count": 51990,
             "total_amount": Decimal("123456.78"),
             "pending_count": 51990,
             "matched_count": 0,
             "excluded_count": 0,
-            "key_ids": ["PACS008:P1"],
+            "pending_payment_amount": Decimal("0"),
         },
         {
-            "id": "g1",
             "movement_type": "SWIFT",
+            "direction": "debit",
             "member_count": 10,
             "total_amount": Decimal("-10.00"),
             "pending_count": 0,
             "matched_count": 10,
             "excluded_count": 0,
-            "key_ids": [],
+            "pending_payment_amount": Decimal("0"),
         },
+    ],
+    "edges": [
+        {"movement_type": "NDGB", "direction": "credit", "key_type": "PACS008"},
     ],
     "meta": {
         "member_count": 52000,
         "type_counts": {"NDGB": 51990, "SWIFT": 10},
-        "hub_key_count": 3,
-        "hub_keys_truncated": True,
-        "group_count": 2,
-        "groups_truncated": False,
+        "pending_payment_amount": Decimal("999.00"),
+        "pending_payment_count": 3,
     },
 }
 
@@ -185,16 +196,36 @@ GRAPH = {
 def test_get_lot_graph_shape_and_404(client, monkeypatch):
     monkeypatch.setattr(
         lot_service, "get_lot_graph",
-        lambda db, lot_id: GRAPH if lot_id == GRAPH["lot_id"] else None,
+        lambda db, lot_id, key_type=None, key_value=None: (
+            GRAPH if lot_id == GRAPH["lot_id"] else None
+        ),
     )
     ok = client.get(f"/lots/{GRAPH['lot_id']}/graph")
     assert ok.status_code == 200
     body = ok.json()
-    assert body["keys"][0]["id"] == "PACS008:P1"
+    assert body["key_types"][0]["key_type"] == "PACS008"
     assert body["groups"][0]["member_count"] == 51990
-    assert body["groups"][1]["key_ids"] == []
-    assert body["meta"]["hub_keys_truncated"] is True
+    assert body["edges"][0]["key_type"] == "PACS008"
+    assert body["meta"]["pending_payment_count"] == 3
     assert client.get("/lots/unknown-lot/graph").status_code == 404
+
+
+def test_get_lot_graph_scopes_to_a_key_value(client, monkeypatch):
+    captured = {}
+
+    def _graph(db, lot_id, key_type=None, key_value=None):
+        captured.update(lot_id=lot_id, key_type=key_type, key_value=key_value)
+        return GRAPH
+
+    monkeypatch.setattr(lot_service, "get_lot_graph", _graph)
+    resp = client.get(
+        f"/lots/{GRAPH['lot_id']}/graph", params={"key_type": "MSGID", "key_value": "MSGA"}
+    )
+    assert resp.status_code == 200
+    assert captured["key_type"] == "MSGID" and captured["key_value"] == "MSGA"
+    assert client.get(
+        f"/lots/{GRAPH['lot_id']}/graph", params={"key_type": "NOPE"}
+    ).status_code == 422
 
 
 def test_list_lot_members_filter_passthrough_and_404(client, monkeypatch):
@@ -244,15 +275,24 @@ def test_list_lot_members_validates_params(client):
     assert client.get(f"/lots/{lot}/members", params={"skip": -1}).status_code == 422
 
 
+LOT_ID = "11111111-1111-4111-8111-111111111111"
+
+
 def _batch_payload(**overrides):
     payload = {
         "flow_code": "float_account_outward",
         "source_code": "finacle_db",
-        "lots": [{"lot_id": "11111111-1111-4111-8111-111111111111"}],
-        "merges": [],
+        "lots": [
+            {
+                "lot_id": LOT_ID,
+                "bucket_kind": "PAIR",
+                "bucket_pacs008": "PACS1",
+                "bucket_msgid": "MSGA",
+            }
+        ],
         "members": [
             {
-                "lot_id": "11111111-1111-4111-8111-111111111111",
+                "lot_id": LOT_ID,
                 "movement_type": "SCTXB",
                 "external_ref": "S1",
                 "account": "0010130015001",
@@ -261,6 +301,52 @@ def _batch_payload(**overrides):
                 "value_date": "2026-07-01T09:30:00",
                 "direction": "debit",
                 "keys": [{"key_type": "PACS008", "key_value": "PACS1"}],
+            }
+        ],
+    }
+    payload.update(overrides)
+    return payload
+
+
+def _split_payload(**overrides):
+    payload = {
+        "flow_code": "float_account_outward",
+        "source_code": "finacle_db",
+        "run_id": 42,
+        "parents": [
+            {
+                "movement_type": "SCTXB",
+                "external_ref": "S1",
+                "account": "0010130015001",
+                "currency": "EUR",
+                "amount": "-1000.00",
+                "direction": "debit",
+                "value_date": "2026-07-01T09:30:00",
+                "payment_count": 3,
+                "payment_amount": "-1000.00",
+                "shared_key_movements": 1,
+                "children": [
+                    {
+                        "external_ref": "S1~aaaaaaaaaa",
+                        "lot_id": LOT_ID,
+                        "amount": "-700.00",
+                        "direction": "debit",
+                        "payment_count": 2,
+                        "bucket_kind": "PAIR",
+                        "bucket_pacs008": "PACS1",
+                        "bucket_msgid": "MSGA",
+                    },
+                    {
+                        "external_ref": "S1~bbbbbbbbbb",
+                        "lot_id": "22222222-2222-4222-8222-222222222222",
+                        "amount": "-300.00",
+                        "direction": "debit",
+                        "payment_count": 1,
+                        "bucket_kind": "PAIR",
+                        "bucket_pacs008": "PACS1",
+                        "bucket_msgid": "MSGB",
+                    },
+                ],
             }
         ],
     }
@@ -290,24 +376,32 @@ def _patch_flow_lookup(monkeypatch, found=True):
 
 def test_lot_batch_ok(client, monkeypatch):
     _patch_flow_lookup(monkeypatch)
-    result = {"lots_created": 1, "merges_applied": 0, "entries_relinked": 0,
-              "members_inserted": 1, "members_updated": 0, "keys_added": 1}
+    result = {"lots_created": 1, "members_inserted": 1, "members_updated": 0,
+              "keys_added": 1}
     monkeypatch.setattr(lot_service, "apply_lot_batch", lambda db, **kw: result)
     resp = client.post("/tasks/finacle-bb/lots/batch", json=_batch_payload())
     assert resp.status_code == 200
     assert resp.json() == {"ok": True, "detail": None, "data": result}
 
 
-def test_lot_batch_conflict_maps_to_409(client, monkeypatch):
+def test_lot_batch_carries_the_bucket_identity_through(client, monkeypatch):
+    """The bucket identity is what the lot row records; dropping it silently
+    would leave every lot looking LEGACY."""
     _patch_flow_lookup(monkeypatch)
+    captured = {}
 
-    def boom(db, **kw):
-        raise CrossLotKeyConflict("key PACS008:PACS1 attached to two lots")
+    def _apply(db, **kw):
+        captured.update(kw)
+        return {"lots_created": 1, "members_inserted": 1, "members_updated": 0,
+                "keys_added": 1}
 
-    monkeypatch.setattr(lot_service, "apply_lot_batch", boom)
-    resp = client.post("/tasks/finacle-bb/lots/batch", json=_batch_payload())
-    assert resp.status_code == 409
-    assert "PACS1" in resp.json()["detail"]
+    monkeypatch.setattr(lot_service, "apply_lot_batch", _apply)
+    assert client.post("/tasks/finacle-bb/lots/batch", json=_batch_payload()).status_code == 200
+    lot = captured["lots"][0]
+    assert (lot.bucket_kind, lot.bucket_pacs008, lot.bucket_msgid) == ("PAIR", "PACS1", "MSGA")
+    # Absent components arrive as '' rather than None — uq_movement_lot_bucket
+    # would not bite on NULLs.
+    assert lot.bucket_po == "" and lot.bucket_ref == ""
 
 
 def test_lot_batch_value_error_maps_to_400(client, monkeypatch):
@@ -335,19 +429,102 @@ def test_lot_batch_unknown_source_404(client, monkeypatch):
     assert resp.status_code == 404
 
 
-def test_key_map_requires_existing_source(client, monkeypatch):
-    class _Query:
-        def filter(self, *a, **k):
-            return self
+# ---------------------------------------------------------------------------
+# splits
+# ---------------------------------------------------------------------------
 
-        def first(self):
-            return None
+def test_split_batch_ok(client, monkeypatch):
+    _patch_flow_lookup(monkeypatch)
+    result = {"parents_inserted": 1, "parents_updated": 0, "ghosts_inserted": 2,
+              "ghosts_updated": 0, "ghosts_skipped": 0, "movements_withdrawn": 1,
+              "parents_emarged": 0, "ghosts_reaped": 0}
+    monkeypatch.setattr(split_service, "apply_split_batch", lambda db, **kw: result)
+    resp = client.post("/tasks/finacle-bb/splits/batch", json=_split_payload())
+    assert resp.status_code == 200
+    assert resp.json() == {"ok": True, "detail": None, "data": result}
 
-    class _FakeDb:
-        def query(self, *a, **k):
-            return _Query()
 
-    app_client = client
-    app_client.app.dependency_overrides[deps.get_db] = lambda: _FakeDb()
-    resp = app_client.get("/tasks/finacle-bb/lots/keys", params={"flow_source_id": 999})
-    assert resp.status_code == 404
+def test_split_batch_forwards_run_id_and_children(client, monkeypatch):
+    _patch_flow_lookup(monkeypatch)
+    captured = {}
+
+    def _apply(db, **kw):
+        captured.update(kw)
+        return {}
+
+    monkeypatch.setattr(split_service, "apply_split_batch", _apply)
+    assert client.post("/tasks/finacle-bb/splits/batch", json=_split_payload()).status_code == 200
+    assert captured["run_id"] == 42
+    parent = captured["parents"][0]
+    assert len(parent.children) == 2
+    assert sum(c.amount for c in parent.children) == parent.amount  # conservation
+
+
+def test_split_batch_unknown_flow_404(client, monkeypatch):
+    _patch_flow_lookup(monkeypatch, found=False)
+    assert client.post(
+        "/tasks/finacle-bb/splits/batch", json=_split_payload()
+    ).status_code == 404
+
+
+def test_get_split_returns_parent_children_and_conservation(client, monkeypatch):
+    detail = {
+        "parent": {
+            "source_hash": "h" * 64,
+            "flow_id": 1,
+            "movement_type": "SCTXB",
+            "external_ref": "S1",
+            "account": "0010130015001",
+            "currency": "EUR",
+            "amount": Decimal("-1000.00"),
+            "direction": "debit",
+            "value_date": NOW,
+            "operation_date": NOW,
+            "transaction_particulars": "SCTXB/O/x",
+            "ref_no": None,
+            "remarks_1": "PACS1",
+            "payment_count": 3,
+            "parent_emarged": False,
+        },
+        "children": [
+            {
+                "entry_id": 7,
+                "source_hash": "c" * 64,
+                "lot_id": LOT_ID,
+                "amount": Decimal("-1000.00"),
+                "currency": "EUR",
+                "direction": "debit",
+                "value_date": NOW,
+                "external_ref": "S1~aaaaaaaaaa",
+                "entry_status": "pending",
+                "match_group_id": None,
+                "payment_count": 3,
+                "bucket_kind": "PAIR",
+                "bucket_pacs008": "PACS1",
+                "bucket_msgid": "MSGA",
+                "bucket_po": None,
+                "bucket_ref": None,
+                "synthetic_only": False,
+            }
+        ],
+        "conservation": {
+            "parent_amount": Decimal("-1000.00"),
+            "children_amount": Decimal("-1000.00"),
+            "missing_amount": Decimal("0"),
+            "payment_amount": Decimal("-990.00"),
+            "payment_gap": Decimal("-10.00"),
+            "child_count": 1,
+        },
+    }
+    monkeypatch.setattr(split_service, "get_split", lambda db, **kw: detail)
+    resp = client.get(f"/splits/{'h' * 64}")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["parent"]["external_ref"] == "S1"
+    assert body["children"][0]["bucket_msgid"] == "MSGA"
+    assert body["conservation"]["missing_amount"] == "0"
+
+
+def test_get_split_unknown_404(client, monkeypatch):
+    monkeypatch.setattr(split_service, "get_split", lambda db, **kw: None)
+    assert client.get(f"/splits/{'z' * 64}").status_code == 404

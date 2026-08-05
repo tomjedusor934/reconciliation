@@ -14,6 +14,7 @@ from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 import logging
 import os
+import re
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 from reco_common import (
@@ -37,6 +38,33 @@ OVERLAP_DAYS = int(os.environ.get("RECO_FINACLE_OVERLAP_DAYS", "2"))
 BACKFILL_SINCE = os.environ.get("RECO_FINACLE_BACKFILL_SINCE", "2026-06-29").strip()
 PO_INSERT_BATCH = 10000  # rows per executemany when filling the #reco_po temp table
 _MAX_REF_LEN = 64        # the lookup temp tables are VARCHAR(64) — longer keys would error
+
+# Why every lookup temp table carries a NON-UNIQUE clustered index instead of a
+# PRIMARY KEY: Python de-duplicates its input case-SENSITIVELY (a set of str),
+# while SQL Server's default collation (SQL_Latin1_General_CP1_CI_AS) compares
+# case-INSENSITIVELY. Two values that are distinct in Python —
+# 'CNS-MAL-202607-o4ATT8ZS-0GoL1Y' and a variant differing only in case — are the
+# same key to SQL Server and violate a PRIMARY KEY, aborting the entire run
+# (seen in prod on the 2026-08-04 backfill). Uniqueness was never required: the
+# index is there to make the join a seek, and a duplicated temp row only repeats
+# join output, which every caller already collapses into a dict. Building the
+# index AFTER the bulk load is also faster.
+_NON_UNIQUE_TEMP_INDEX = "see the comment above — do not restore PRIMARY KEY"
+
+# std.Payment amount column. Confirmed against the datamart = SettlementAmount
+# (std.Movement uses TransactionAmount; the two differ). Override with
+# RECO_FINACLE_PAYMENT_AMOUNT_COL if the datamart schema ever changes. Defined
+# here, in the module both reco_datamart_bb and reco_payment_status import, so
+# the two stay on one definition without importing each other.
+PAYMENT_AMOUNT_COL = os.environ.get(
+    "RECO_FINACLE_PAYMENT_AMOUNT_COL", "SettlementAmount"
+).strip()
+# Interpolated into SQL, never bound — validate it is an identifier and nothing else.
+if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", PAYMENT_AMOUNT_COL):
+    raise ValueError(
+        f"RECO_FINACLE_PAYMENT_AMOUNT_COL must be a bare SQL identifier, "
+        f"got {PAYMENT_AMOUNT_COL!r}"
+    )
 
 # reco_id classification from TransactionParticulars (see example/flow_schema.txt).
 INSTANT_PREFIXES = {"SWIFT", "SCRT1", "BKRTP"}       # ref_no filled -> instant payment
@@ -386,13 +414,15 @@ def resolve_bulk_returns(lookup_conn, po_ids) -> Dict[str, Optional[str]]:
     cursor = lookup_conn.cursor()
     try:
         cursor.execute("IF OBJECT_ID('tempdb..#reco_po') IS NOT NULL DROP TABLE #reco_po")
-        cursor.execute("CREATE TABLE #reco_po (po VARCHAR(64) PRIMARY KEY)")
+        # Non-unique index, built after the load — see _NON_UNIQUE_TEMP_INDEX.
+        cursor.execute("CREATE TABLE #reco_po (po VARCHAR(64) NOT NULL)")
         cursor.fast_executemany = True
         for i in range(0, len(po_list), PO_INSERT_BATCH):
             cursor.executemany(
                 "INSERT INTO #reco_po (po) VALUES (?)",
                 [(p,) for p in po_list[i:i + PO_INSERT_BATCH]],
             )
+        cursor.execute("CREATE CLUSTERED INDEX ix_temp_k ON #reco_po (po)")
         cursor.execute(
             """
             SELECT t.po,
@@ -434,13 +464,15 @@ def resolve_return_recos(lookup_conn, return_po_ids) -> Dict[str, Optional[str]]
     cursor = lookup_conn.cursor()
     try:
         cursor.execute("IF OBJECT_ID('tempdb..#reco_retpo') IS NOT NULL DROP TABLE #reco_retpo")
-        cursor.execute("CREATE TABLE #reco_retpo (po VARCHAR(64) PRIMARY KEY)")
+        # Non-unique index, built after the load — see _NON_UNIQUE_TEMP_INDEX.
+        cursor.execute("CREATE TABLE #reco_retpo (po VARCHAR(64) NOT NULL)")
         cursor.fast_executemany = True
         for i in range(0, len(po_list), PO_INSERT_BATCH):
             cursor.executemany(
                 "INSERT INTO #reco_retpo (po) VALUES (?)",
                 [(p,) for p in po_list[i:i + PO_INSERT_BATCH]],
             )
+        cursor.execute("CREATE CLUSTERED INDEX ix_temp_k ON #reco_retpo (po)")
         cursor.execute(
             """
             SELECT t.po,
@@ -491,13 +523,15 @@ def resolve_reversals(lookup_conn, refs) -> Tuple[Dict[str, Optional[str]], set]
     cursor = lookup_conn.cursor()
     try:
         cursor.execute("IF OBJECT_ID('tempdb..#reco_ref') IS NOT NULL DROP TABLE #reco_ref")
-        cursor.execute("CREATE TABLE #reco_ref (ref VARCHAR(64) PRIMARY KEY)")
+        # Non-unique index, built after the load — see _NON_UNIQUE_TEMP_INDEX.
+        cursor.execute("CREATE TABLE #reco_ref (ref VARCHAR(64) NOT NULL)")
         cursor.fast_executemany = True
         for i in range(0, len(ref_list), PO_INSERT_BATCH):
             cursor.executemany(
                 "INSERT INTO #reco_ref (ref) VALUES (?)",
                 [(r,) for r in ref_list[i:i + PO_INSERT_BATCH]],
             )
+        cursor.execute("CREATE CLUSTERED INDEX ix_temp_k ON #reco_ref (ref)")
         cursor.execute(
             f"""
             SELECT t.ref,
@@ -586,13 +620,16 @@ def resolve_bulk_groups(lookup_conn, po_ids, msg_ids=None) -> Tuple[Dict[str, st
             ("#reco_bmsg", "msg", 128, msg_list),
         ):
             cursor.execute(f"IF OBJECT_ID('tempdb..{tmp}') IS NOT NULL DROP TABLE {tmp}")
-            cursor.execute(f"CREATE TABLE {tmp} ({col} VARCHAR({size}) PRIMARY KEY)")
+            # Non-unique index, built after the load — see _NON_UNIQUE_TEMP_INDEX.
+            # #reco_bmsg holds MessageIDs, the very population that collided.
+            cursor.execute(f"CREATE TABLE {tmp} ({col} VARCHAR({size}) NOT NULL)")
             cursor.fast_executemany = True
             for i in range(0, len(values), PO_INSERT_BATCH):
                 cursor.executemany(
                     f"INSERT INTO {tmp} ({col}) VALUES (?)",
                     [(v,) for v in values[i:i + PO_INSERT_BATCH]],
                 )
+            cursor.execute(f"CREATE CLUSTERED INDEX ix_temp_k ON {tmp} ({col})")
         cursor.execute(
             f"""
             SELECT p2.MessageID, p2.PaymentNumber, p2.{PAYMENT_INIT_MODULE_COLUMN}

@@ -15,6 +15,7 @@ from app.api.v1.endpoints import (
     roles,
     settings,
     source_connections,
+    splits,
     sso,
     tasks,
     tasks_lots,
@@ -41,6 +42,7 @@ api_router.include_router(
     match_groups.router, tags=["reconciliation"], prefix="/match-groups"
 )
 api_router.include_router(lots.router, tags=["reconciliation"], prefix="/lots")
+api_router.include_router(splits.router, tags=["reconciliation"], prefix="/splits")
 api_router.include_router(
     ingestion_runs.router, tags=["reconciliation"], prefix="/ingestion-runs"
 )

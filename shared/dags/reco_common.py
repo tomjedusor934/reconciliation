@@ -171,24 +171,28 @@ def finacle_complete_run(
 
 
 # ---------------------------------------------------------------------------
-# Finacle BATCH BOOKING TRUE — the DAG clusters movements into lots (shared
-# PACS008/MSGID/PO keys) and persists the lots/members/keys backend-side.
-# Entries themselves go through the regular /tasks/finacle/runs lifecycle.
+# Finacle BATCH BOOKING TRUE — the DAG buckets movements by (PACS008 × MSGID),
+# splitting the ones that span several buckets into ghost movements, and
+# persists the buckets/members/keys and the split parents backend-side.
+# Entries themselves go through the regular /tasks/finacle/runs lifecycle;
+# ghosts are created by the split push, which owns their whole lifecycle.
+# There is no key-map call: a bucket id is a uuid5 of its identity, so the DAG
+# never reads back what earlier runs produced.
 # ---------------------------------------------------------------------------
 
-def finacle_bb_get_key_map(flow_source_id: int) -> Dict[str, Any]:
-    """key -> lot map of every ACTIVE lot of the source; seeds the union-find
-    so late movements join lots created in previous runs."""
-    return call_backend(
-        "GET",
-        "/tasks/finacle-bb/lots/keys",
-        params={"flow_source_id": flow_source_id},
-    )
+def finacle_bb_post_split_batch(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Push one split batch {flow_code, source_code, run_id, parents}.
+
+    Applied atomically: parents registered, their ghosts materialised as
+    entries, the real movements withdrawn, and the ghosts a parent no longer
+    produces reaped. Must land BEFORE the matching lot batch.
+    """
+    return call_backend("POST", "/tasks/finacle-bb/splits/batch", json=payload)
 
 
 def finacle_bb_post_lot_batch(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Push one clustering batch {flow_code, source_code, lots, merges, members}
-    — applied atomically by the backend (409 = stale key map, re-run)."""
+    """Push one bucket batch {flow_code, source_code, lots, members} — applied
+    atomically by the backend, and idempotent (same bucket, same uuid5)."""
     return call_backend("POST", "/tasks/finacle-bb/lots/batch", json=payload)
 
 

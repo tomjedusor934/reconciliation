@@ -18,8 +18,13 @@ const props = defineProps<{
   keys: LotKey[];
 }>();
 
+const emit = defineEmits<{ (e: 'open-split', parentHash: string): void }>();
+
 const graph = computed(() => buildLotGraph(props.members, props.keys));
 
+// ``movement`` is rendered through the #node-movement slot instead of being
+// registered here: Vue Flow instantiates registered node components itself, so
+// their emits never reach this parent.
 const nodeTypes = {
   movement: markRaw(LotMovementNode),
   key: markRaw(LotKeyNode),
@@ -39,6 +44,9 @@ const nodeTypes = {
         :min-zoom="0.15"
         fit-view-on-init
       >
+        <template #node-movement="nodeProps">
+          <LotMovementNode :data="nodeProps.data" @open-split="emit('open-split', $event)" />
+        </template>
         <Background />
         <Controls :show-interactive="false" />
         <MiniMap pannable zoomable />
@@ -53,6 +61,10 @@ const nodeTypes = {
       <span class="inline-flex items-center gap-1">
         <span class="inline-block h-0.5 w-4 bg-gray-400 animate-pulse" />
         animated edge = pending entry
+      </span>
+      <span class="inline-flex items-center gap-1">
+        <span class="inline-block h-3 w-4 rounded border-2 border-dashed border-indigo-300" />
+        dashed = slice of a batch movement
       </span>
     </div>
   </div>

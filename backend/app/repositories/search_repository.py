@@ -199,11 +199,13 @@ class SearchRepository:
     def merge_chain(self, db: Session, *, lot_ids: Sequence[str]) -> List[str]:
         """Lots related to these by a merge, followed BOTH ways.
 
-        ``apply_merge`` relinks members and live PENDING entries to the survivor
-        but does not rewrite entry_payment_status.reco_id, and already-émargé
-        entries keep the absorbed lot's uuid. So a payment legitimately resolves
-        to an absorbed lot while its members live in the survivor — both must be
-        surfaced. The visited set guards against a cycle.
+        Historical only: the retired union-find clustering could absorb one lot
+        into another, relinking members and live PENDING entries to the survivor
+        without rewriting entry_payment_status.reco_id, and already-émargé
+        entries kept the absorbed lot's uuid. So a payment still resolves to an
+        absorbed lot while its members live in the survivor — both must be
+        surfaced. Buckets never merge, so no new chain can appear. The visited
+        set guards against a cycle.
         """
         if not lot_ids:
             return []
