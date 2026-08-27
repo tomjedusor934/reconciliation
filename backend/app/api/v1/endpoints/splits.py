@@ -17,8 +17,8 @@ def get_split(
     db: Session = Depends(deps.get_db),
     _: User = Depends(deps.get_current_active_user),
 ):
-    """The real movement behind a ghost, all its sibling ghosts, and whether the
-    amounts still add back up to it.
+    """The real movement behind a ghost, its claim group (every parent sharing
+    the aggregate key), the group's ghosts, and whether the group adds up.
 
     Children are read from both the live and the émargement tables, so a split
     stays readable long after its ghosts have been matched.

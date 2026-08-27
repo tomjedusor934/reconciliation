@@ -20,6 +20,7 @@ export interface LotFilters {
   bucket_kind?: string;
   synthetic_only?: boolean;
   payment_gap?: boolean;
+  parent_mismatch?: boolean;
   skip?: number;
   limit?: number;
 }

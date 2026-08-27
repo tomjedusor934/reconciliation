@@ -5,11 +5,17 @@ import TextArea from '@/components/ui/TextArea.vue';
 import Button from '@/components/ui/Button.vue';
 import Badge from '@/components/ui/Badge.vue';
 import { formatAmount } from '@/utils/formatAmount';
+import { fromMinor, sumMinor } from '@/utils/decimal';
 import matchGroupService from '@/services/matchGroupService';
 import toaster from '@/utils/toaster';
-import type { ReconciliationEntry } from '@/types';
+import type { BasketItem, ReconciliationEntry } from '@/types';
 
-const props = defineProps<{ modelValue: boolean; entries: ReconciliationEntry[] }>();
+/** Works off either a live selection or a basket — both carry the fields the
+ *  pre-flight checks and the request need. */
+type Forceable = Pick<ReconciliationEntry, 'id' | 'flow_id' | 'currency' | 'amount'> &
+  Partial<Pick<BasketItem, 'current_status' | 'missing'>>;
+
+const props = defineProps<{ modelValue: boolean; entries: Forceable[] }>();
 const emit = defineEmits<{
   (e: 'update:modelValue', v: boolean): void;
   (e: 'forced'): void;
@@ -18,15 +24,24 @@ const emit = defineEmits<{
 const comment = ref('');
 const submitting = ref(false);
 
-const total = computed(() =>
-  props.entries.reduce((acc, e) => acc + Number(e.amount || 0), 0),
-);
-const isBalanced = computed(() => Math.abs(total.value) < 0.005);
+// Exact, in minor units: the backend requires sum == Decimal("0") on the nose,
+// so a float tolerance here would green-light groups it then rejects.
+const totalMinor = computed(() => sumMinor(props.entries.map((e) => e.amount)));
+const total = computed(() => fromMinor(totalMinor.value));
+const isBalanced = computed(() => totalMinor.value === 0);
 const flowsConsistent = computed(() => {
   const flows = new Set(props.entries.map((e) => e.flow_id));
   const ccy = new Set(props.entries.map((e) => e.currency));
   return flows.size <= 1 && ccy.size <= 1;
 });
+// Rows a basket refresh found already reconciled or gone — force_match would
+// reject the whole group on them.
+const staleCount = computed(
+  () =>
+    props.entries.filter(
+      (e) => e.missing === true || (e.current_status !== undefined && e.current_status !== 'pending'),
+    ).length,
+);
 
 const close = () => emit('update:modelValue', false);
 
@@ -71,6 +86,10 @@ const submit = async () => {
         <div v-if="!flowsConsistent" class="text-red-600 text-xs font-medium">
           Entries don't share the same flow / currency.
         </div>
+        <div v-if="staleCount > 0" class="text-red-600 text-xs font-medium">
+          {{ staleCount }} entr{{ staleCount === 1 ? 'y is' : 'ies are' }} no longer pending — remove
+          them from the basket first.
+        </div>
       </div>
       <TextArea
         v-model="comment"
@@ -82,7 +101,7 @@ const submit = async () => {
         <Button
           variant="reveals-primary"
           action="edit"
-          :disabled="submitting || !flowsConsistent || !isBalanced || entries.length < 2"
+          :disabled="submitting || !flowsConsistent || !isBalanced || staleCount > 0 || entries.length < 2"
           @click="submit"
         >Force match</Button>
       </div>

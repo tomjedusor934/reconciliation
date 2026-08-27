@@ -181,11 +181,12 @@ def finacle_complete_run(
 # ---------------------------------------------------------------------------
 
 def finacle_bb_post_split_batch(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Push one split batch {flow_code, source_code, run_id, parents}.
+    """Push one split batch {flow_code, source_code, run_id, groups}.
 
-    Applied atomically: parents registered, their ghosts materialised as
-    entries, the real movements withdrawn, and the ghosts a parent no longer
-    produces reaped. Must land BEFORE the matching lot batch.
+    Applied atomically per claim group: its parents registered, its ghosts
+    materialised as entries (anchored on the group's canonical parent), the
+    real movements withdrawn, and the ghosts the group no longer produces
+    reaped. Must land BEFORE the matching lot batch.
     """
     return call_backend("POST", "/tasks/finacle-bb/splits/batch", json=payload)
 

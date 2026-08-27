@@ -6,8 +6,15 @@ import Button from '@/components/ui/Button.vue';
 import { formatDateShort } from '@/utils/formatDate';
 import { formatAmount } from '@/utils/formatAmount';
 import reconciliationService from '@/services/reconciliationService';
+import { fromMinor, sumMinor } from '@/utils/decimal';
 import toaster from '@/utils/toaster';
 import type { ReconciliationEntry } from '@/types';
+
+/** There is no bulk exclude endpoint, so this fans out one POST per entry.
+ *  Since the operational view gained a "select all", that set can be thousands
+ *  of rows — firing them all at once would swamp the API, so they go in bounded
+ *  waves instead. */
+const EXCLUDE_CONCURRENCY = 10;
 
 const props = defineProps<{ modelValue: boolean; entry: ReconciliationEntry | null; entries?: ReconciliationEntry[] }>();
 const emit = defineEmits<{
@@ -17,13 +24,35 @@ const emit = defineEmits<{
 
 const reason = ref('');
 const submitting = ref(false);
+const done = ref(0);
 
 const close = () => emit('update:modelValue', false);
 
 const isMultiple = computed(() => props.entries && props.entries.length > 0);
-const totalAmount = computed(() => 
-  props.entries?.reduce((acc, e) => acc + Number(e.amount || 0), 0) || 0
+const totalAmount = computed(() =>
+  fromMinor(sumMinor((props.entries ?? []).map((e) => e.amount))),
 );
+
+/** Exclude in bounded waves. allSettled, not all: a rejection must not hide the
+ *  fact that the rest went through — the entries are already excluded server
+ *  side and the operator has to know which ones. */
+const excludeMany = async (entries: ReconciliationEntry[], why: string) => {
+  let ok = 0;
+  const errors: string[] = [];
+  done.value = 0;
+  for (let i = 0; i < entries.length; i += EXCLUDE_CONCURRENCY) {
+    const wave = entries.slice(i, i + EXCLUDE_CONCURRENCY);
+    const results = await Promise.allSettled(
+      wave.map((e) => reconciliationService.exclude({ entry_id: e.id, reason: why })),
+    );
+    for (const r of results) {
+      if (r.status === 'fulfilled') ok += 1;
+      else errors.push((r.reason as any)?.response?.data?.detail || 'unknown error');
+    }
+    done.value += wave.length;
+  }
+  return { ok, failed: errors.length, firstError: errors[0] };
+};
 
 const submit = async () => {
   if (!reason.value.trim()) {
@@ -34,16 +63,17 @@ const submit = async () => {
   submitting.value = true;
   try {
     if (isMultiple.value && props.entries) {
-      // Bulk exclusion
-      await Promise.all(
-        props.entries.map((entry) =>
-          reconciliationService.exclude({
-            entry_id: entry.id,
-            reason: reason.value.trim(),
-          }),
-        ),
-      );
-      toaster.success(`${props.entries.length} entries excluded`);
+      const { ok, failed, firstError } = await excludeMany(props.entries, reason.value.trim());
+      if (ok === 0) {
+        toaster.error(`Exclusion failed: ${firstError}`);
+        return; // nothing was excluded — leave the modal open to retry
+      }
+      if (failed > 0) {
+        // Partly applied: say so, the caller reloads and the rest stay pending.
+        toaster.warning(`${ok} entries excluded, ${failed} failed (${firstError})`);
+      } else {
+        toaster.success(`${ok} entries excluded`);
+      }
     } else if (props.entry) {
       // Single exclusion
       await reconciliationService.exclude({
@@ -59,6 +89,7 @@ const submit = async () => {
     toaster.error(e?.response?.data?.detail || 'Exclusion failed');
   } finally {
     submitting.value = false;
+    done.value = 0;
   }
 };
 </script>
@@ -94,7 +125,12 @@ const submit = async () => {
           action="delete" 
           @click="submit"
         >
-          {{ isMultiple ? `Exclude ${entries?.length} entries` : 'Exclude' }}
+          <template v-if="submitting && isMultiple">
+            Excluding… {{ done }} / {{ entries?.length }}
+          </template>
+          <template v-else>
+            {{ isMultiple ? `Exclude ${entries?.length} entries` : 'Exclude' }}
+          </template>
         </Button>
       </div>
     </div>

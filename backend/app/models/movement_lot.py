@@ -52,14 +52,15 @@ BUCKET_PAIR = "PAIR"              # pacs008 AND MessageID — the nominal case
 BUCKET_PACS_ONLY = "PACS_ONLY"    # payment carries no MessageID
 BUCKET_MSGID_ONLY = "MSGID_ONLY"  # payment carries no pacs008
 BUCKET_PO = "PO"                  # neither: single payment, keyed on PaymentNumber
-BUCKET_RESIDUAL = "RESIDUAL"      # ref = parent source_hash; holds a split's leftover
+# RESIDUAL (a split's leftover in a bucket of its own) is retired: the gap
+# between a claim group's parents and its ghosts is measured by the second
+# reconciliation and tagged on the lots (parent_mismatch), never materialised.
 BUCKET_LEGACY = "LEGACY"          # lot from the retired union-find clustering
 BUCKET_KINDS = (
     BUCKET_PAIR,
     BUCKET_PACS_ONLY,
     BUCKET_MSGID_ONLY,
     BUCKET_PO,
-    BUCKET_RESIDUAL,
     BUCKET_LEGACY,
 )
 
@@ -82,8 +83,13 @@ class MovementLot(Base):
     bucket_ref = Column(String(64), nullable=False, server_default="")
     # Every member is a ghost: the lot balances by construction (both sides are
     # derived from the same std.Payment amounts) and proves nothing on its own —
-    # the real control is the parent-level conservation in ``movement_split``.
+    # the real control is the claim-group reconciliation in ``movement_split``.
     synthetic_only = Column(Boolean, nullable=False, server_default="false")
+    # Set by the second reconciliation (refresh_parent_mismatch, run after every
+    # auto-match): this lot carries a ghost of a claim group whose parents do
+    # not add up to its ghosts. Even a matched lot then stays visibly
+    # not-fully-validated — the counterpart matched, the parent side did not.
+    parent_mismatch = Column(Boolean, nullable=False, server_default="false")
 
     status = Column(String(16), nullable=False, default=LOT_STATUS_ACTIVE)  # active | merged
     merged_into_lot_id = Column(String(36), ForeignKey("reco.movement_lot.id"), nullable=True)

@@ -313,21 +313,31 @@ def _split_payload(**overrides):
         "flow_code": "float_account_outward",
         "source_code": "finacle_db",
         "run_id": 42,
-        "parents": [
+        "groups": [
             {
-                "movement_type": "SCTXB",
-                "external_ref": "S1",
+                "claim_key_type": "PACS008",
+                "claim_key_value": "PACS1",
                 "account": "0010130015001",
                 "currency": "EUR",
-                "amount": "-1000.00",
-                "direction": "debit",
                 "value_date": "2026-07-01T09:30:00",
-                "payment_count": 3,
-                "payment_amount": "-1000.00",
-                "shared_key_movements": 1,
+                "event_type": "TR",
+                "parents": [
+                    {
+                        "movement_type": "SCTXB",
+                        "external_ref": "S1",
+                        "account": "0010130015001",
+                        "currency": "EUR",
+                        "amount": "-1000.00",
+                        "direction": "debit",
+                        "value_date": "2026-07-01T09:30:00",
+                        "payment_count": 3,
+                        "payment_amount": "-1000.00",
+                        "shared_key_movements": 1,
+                    }
+                ],
                 "children": [
                     {
-                        "external_ref": "S1~aaaaaaaaaa",
+                        "external_ref": "KEY:PACS1~aaaaaaaa~aaaaaaaaaa",
                         "lot_id": LOT_ID,
                         "amount": "-700.00",
                         "direction": "debit",
@@ -337,7 +347,7 @@ def _split_payload(**overrides):
                         "bucket_msgid": "MSGA",
                     },
                     {
-                        "external_ref": "S1~bbbbbbbbbb",
+                        "external_ref": "KEY:PACS1~aaaaaaaa~bbbbbbbbbb",
                         "lot_id": "22222222-2222-4222-8222-222222222222",
                         "amount": "-300.00",
                         "direction": "debit",
@@ -435,16 +445,16 @@ def test_lot_batch_unknown_source_404(client, monkeypatch):
 
 def test_split_batch_ok(client, monkeypatch):
     _patch_flow_lookup(monkeypatch)
-    result = {"parents_inserted": 1, "parents_updated": 0, "ghosts_inserted": 2,
-              "ghosts_updated": 0, "ghosts_skipped": 0, "movements_withdrawn": 1,
-              "parents_emarged": 0, "ghosts_reaped": 0}
+    result = {"groups": 1, "parents_inserted": 1, "parents_updated": 0,
+              "ghosts_inserted": 2, "ghosts_updated": 0, "ghosts_skipped": 0,
+              "movements_withdrawn": 1, "parents_emarged": 0, "ghosts_reaped": 0}
     monkeypatch.setattr(split_service, "apply_split_batch", lambda db, **kw: result)
     resp = client.post("/tasks/finacle-bb/splits/batch", json=_split_payload())
     assert resp.status_code == 200
     assert resp.json() == {"ok": True, "detail": None, "data": result}
 
 
-def test_split_batch_forwards_run_id_and_children(client, monkeypatch):
+def test_split_batch_forwards_run_id_and_groups(client, monkeypatch):
     _patch_flow_lookup(monkeypatch)
     captured = {}
 
@@ -455,9 +465,12 @@ def test_split_batch_forwards_run_id_and_children(client, monkeypatch):
     monkeypatch.setattr(split_service, "apply_split_batch", _apply)
     assert client.post("/tasks/finacle-bb/splits/batch", json=_split_payload()).status_code == 200
     assert captured["run_id"] == 42
-    parent = captured["parents"][0]
-    assert len(parent.children) == 2
-    assert sum(c.amount for c in parent.children) == parent.amount  # conservation
+    group = captured["groups"][0]
+    assert (group.claim_key_type, group.claim_key_value) == ("PACS008", "PACS1")
+    assert len(group.parents) == 1 and len(group.children) == 2
+    # Ghosts are the buckets' exact payment sums — with the payments matching
+    # the booking here, they add up to the group's parents.
+    assert sum(c.amount for c in group.children) == group.parents[0].amount
 
 
 def test_split_batch_unknown_flow_404(client, monkeypatch):
@@ -467,7 +480,7 @@ def test_split_batch_unknown_flow_404(client, monkeypatch):
     ).status_code == 404
 
 
-def test_get_split_returns_parent_children_and_conservation(client, monkeypatch):
+def test_get_split_returns_parent_group_and_children(client, monkeypatch):
     detail = {
         "parent": {
             "source_hash": "h" * 64,
@@ -484,18 +497,40 @@ def test_get_split_returns_parent_children_and_conservation(client, monkeypatch)
             "ref_no": None,
             "remarks_1": "PACS1",
             "payment_count": 3,
+            "claim_key_type": "PACS008",
+            "claim_key_value": "PACS1",
             "parent_emarged": False,
+        },
+        "group": {
+            "claim_key_type": "PACS008",
+            "claim_key_value": "PACS1",
+            "canonical_source_hash": "h" * 64,
+            "parents": [
+                {
+                    "source_hash": "h" * 64,
+                    "movement_type": "SCTXB",
+                    "external_ref": "S1",
+                    "amount": Decimal("-1000.00"),
+                    "currency": "EUR",
+                    "value_date": NOW,
+                    "parent_emarged": False,
+                }
+            ],
+            "parent_total": Decimal("-1000.00"),
+            "children_total": Decimal("-990.00"),
+            "delta": Decimal("-10.00"),
+            "payment_amount": Decimal("-990.00"),
         },
         "children": [
             {
                 "entry_id": 7,
                 "source_hash": "c" * 64,
                 "lot_id": LOT_ID,
-                "amount": Decimal("-1000.00"),
+                "amount": Decimal("-990.00"),
                 "currency": "EUR",
                 "direction": "debit",
                 "value_date": NOW,
-                "external_ref": "S1~aaaaaaaaaa",
+                "external_ref": "KEY:PACS1~aaaaaaaa~aaaaaaaaaa",
                 "entry_status": "pending",
                 "match_group_id": None,
                 "payment_count": 3,
@@ -507,14 +542,6 @@ def test_get_split_returns_parent_children_and_conservation(client, monkeypatch)
                 "synthetic_only": False,
             }
         ],
-        "conservation": {
-            "parent_amount": Decimal("-1000.00"),
-            "children_amount": Decimal("-1000.00"),
-            "missing_amount": Decimal("0"),
-            "payment_amount": Decimal("-990.00"),
-            "payment_gap": Decimal("-10.00"),
-            "child_count": 1,
-        },
     }
     monkeypatch.setattr(split_service, "get_split", lambda db, **kw: detail)
     resp = client.get(f"/splits/{'h' * 64}")
@@ -522,7 +549,8 @@ def test_get_split_returns_parent_children_and_conservation(client, monkeypatch)
     body = resp.json()
     assert body["parent"]["external_ref"] == "S1"
     assert body["children"][0]["bucket_msgid"] == "MSGA"
-    assert body["conservation"]["missing_amount"] == "0"
+    assert body["group"]["delta"] == "-10.00"
+    assert body["group"]["parents"][0]["source_hash"] == "h" * 64
 
 
 def test_get_split_unknown_404(client, monkeypatch):

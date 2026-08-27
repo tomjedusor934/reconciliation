@@ -31,6 +31,7 @@ def list_entries(
 ):
     items, total_count = reconciliation_service.list_entries_filtered(
         db,
+        ids=filters.ids,
         flow_id=filters.flow_id,
         status=filters.status,
         reco_id=filters.reco_id,

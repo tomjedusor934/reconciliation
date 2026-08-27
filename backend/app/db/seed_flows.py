@@ -180,6 +180,76 @@ def _finacle_bb_source(accounts: list) -> dict:
     return source
 
 
+# Datamart identifiers the WERO extraction interpolates into its SQL. Seeded
+# explicitly (rather than left to the DAG's own defaults) so they are visible
+# and editable from the UI: the WERO table name and std.Payment's end-to-end
+# column are unconfirmed, and retuning them must not require a DAG redeploy.
+# Keys absent here fall back to reco_wero.DEFAULT_CONFIG.
+WERO_PARSER_CONFIG = {
+    "wero_table": "std.Wero",
+    "wero_ref_column": "OriginatorReference",
+    "wero_id_column": "CaptureIDMoneyTransferID",
+    "wero_date_column": "SettlementRelatedTimestamp",
+    # Incremental filter — a real DATE, deliberately not the varchar business
+    # timestamp above (see reco_wero.DEFAULT_CONFIG).
+    "wero_watermark_column": "StartDate",
+    "wero_amount_column": "TransactionAmount",
+    "wero_currency_column": "Currency",
+    "wero_direction_column": "TransactionDirection",
+    "wero_status_column": "SettlementStatus",
+    # Confirmed 2026-08-26: SettlementStatus only holds Accepted / Failed /
+    # Rejected / Settled — there is no reversal status. Kept empty, so no WERO
+    # reversal leg is emitted and a Finacle return stays visibly unmatched
+    # rather than pairing with a wrong row (diagnostics query C).
+    "wero_reversal_statuses": [],
+    # Whitelist of statuses worth reconciling; empty = all (no filtering).
+    # 67% of the acceptance rows are Failed/Rejected and probably never reached
+    # Finacle, but acceptance fails a lot by nature — measure production with
+    # diagnostics query A before narrowing this.
+    "wero_settlement_statuses": [],
+    "payment_e2e_column": "EndToEndId",
+    "payment_init_modules": ["WERO", "WEROEMC"],
+    "payment_date_column": "CreatedOn",
+    # Left None deliberately — see reco_wero.DEFAULT_CONFIG: these three touch
+    # the match key or the amount, and the columns are confirmed to EXIST but
+    # not to be POPULATED (diagnostics query D).
+    "payment_currency_column": None,
+    "return_date_column": None,
+    "return_amount_column": None,
+    # Display only (transaction_particulars), never the match key -> safe.
+    "return_status_column": "Status",
+    "returns_enabled": True,
+    "default_currency": "EUR",
+}
+
+
+def _wero_source() -> dict:
+    """The WERO datamart source: a payment reconciliation, not an accounting one.
+
+    Reads the WERO table + std.Payment + std.[Return] and pushes one entry per
+    leg, all sharing the end-to-end reference as reco_id, WERO side credit and
+    Finacle side debit — so the standard sum-to-zero engine matches them with no
+    change (see shared/dags/reco_wero.py). It carries NO reference account: the
+    perimeter is InitModule, not a GL account.
+    """
+    return {
+        "code": "wero",
+        "name": "WERO (datamart)",
+        "description": (
+            "WERO payments reconciled against std.Payment / std.[Return] by the "
+            "Airflow ingest_wero DAG."
+        ),
+        "is_active": True,
+        "source_type": FlowSourceType.FINACLE_DB,
+        "parser_type": ParserType.WERO,
+        "match_key_strategy": MatchKeyStrategy.RECO_ID_AMOUNT,
+        "inbox_subfolder": None,
+        "file_pattern": None,
+        "parser_config": dict(WERO_PARSER_CONFIG),
+        "accounts": [],
+    }
+
+
 # One-shot parser upgrades for EXISTING installs. seed_flows() never overrides
 # user customizations on existing sources, so a deliberate parser change must
 # ship here: (flow_code, source_code) -> (old parser, new parser). Applied only
@@ -307,6 +377,17 @@ SEED_FLOWS = [
             _finacle_source([("0010110001080", "CASH IN SHOP")]),
             WEBRIPOST_SOURCE,
         ],
+    },
+    {
+        "code": "wero", "name": "WERO",
+        "description": (
+            "WERO payment reconciliation: the datamart WERO table against "
+            "std.Payment / std.[Return] on the end-to-end reference."
+        ),
+        # Inactive until the datamart identifiers in WERO_PARSER_CONFIG are
+        # confirmed (WERO table name, std.Payment end-to-end column).
+        "is_active": False, "default_currency": "EUR",
+        "sources": [_wero_source()],
     }
 
     # ---- Legacy flows (commented out) ----

@@ -19,6 +19,7 @@ from app.models.reconciliation_entry import EntryStatus
 from app.models.reconciliation_run import ReconciliationRun
 from app.repositories.exclusion_repository import exclusion_repository
 from app.repositories.match_group_repository import match_group_repository
+from app.repositories.movement_split_repository import movement_split_repository
 from app.repositories.reconciliation_entry_repository import reconciliation_entry_repository
 from app.repositories.reconciliation_run_repository import reconciliation_run_repository
 from app.services.payment_status_service import payment_status_service
@@ -47,6 +48,7 @@ class ReconciliationService:
         self,
         db: Session,
         *,
+        ids=None,
         flow_id=None,
         status=None,
         reco_id=None,
@@ -64,6 +66,7 @@ class ReconciliationService:
         with_payment_statuses: bool = True,
     ):
         filter_kwargs = dict(
+            ids=ids,
             flow_id=flow_id,
             status=status,
             reco_id=reco_id,
@@ -297,6 +300,13 @@ class ReconciliationService:
                 )
                 groups_created += 1
                 entries_matched += count
+            # Second reconciliation: per claim group, do the split parents add
+            # up to the ghosts standing in for them? Tags/clears
+            # movement_lot.parent_mismatch — after the matching, so a lot that
+            # just matched still gets tagged when its parent side does not add
+            # up (matching the counterpart is NOT validating the parents).
+            movement_split_repository.refresh_parent_mismatch(db)
+            db.commit()
         except Exception:
             # The failing statement (a deadlock victim, say) leaves the psycopg2
             # transaction aborted: without this rollback every later statement
@@ -336,19 +346,46 @@ class ReconciliationService:
         """Force a manual match. Pre-flight controls per spec:
         - all entries must belong to the same flow
         - same currency
-        - sum must be zero (unless an explicit comment justifies otherwise)
+        - sum must be zero
+
+        Built for baskets: the caller may hand over hundreds of ids spanning
+        several reco_ids, assembled over several searches. That makes three
+        things matter that did not when this only ever saw two hand-picked rows —
+        the ids are read in one query, every bad id is reported at once rather
+        than just the first, and a group that could not be marked in full is
+        rolled back instead of being left half-built.
         """
         if not entry_ids:
             raise ValueError("at least one entry is required")
 
-        entries = []
-        for entry_id in entry_ids:
-            e = reconciliation_entry_repository.get_one(db, entry_id=entry_id)
-            if e is None:
-                raise ValueError(f"entry {entry_id} not found")
-            if e.status != EntryStatus.PENDING:
-                raise ValueError(f"entry {entry_id} is not pending (status={e.status})")
-            entries.append(e)
+        # Deduplicate, preserving order: the same id sent twice would otherwise
+        # be counted twice in the total and "balance" a group that does not.
+        seen: set = set()
+        ids = [i for i in entry_ids if not (i in seen or seen.add(i))]
+
+        # One query for the whole basket, not one per id.
+        found = reconciliation_entry_repository.get_many(db, entry_ids=ids)
+        by_id = {e.id: e for e in found}
+
+        # get_many reads the live table only, which is where PENDING lives; an id
+        # missing from it is either gone or already émargé.
+        missing = [i for i in ids if i not in by_id]
+        if missing:
+            raise ValueError(
+                "entries not found or already reconciled: "
+                + ", ".join(str(i) for i in missing)
+            )
+        not_pending = [e for e in found if e.status != EntryStatus.PENDING]
+        if not_pending:
+            raise ValueError(
+                "entries are not pending: "
+                + ", ".join(
+                    f"{e.id} (status={getattr(e.status, 'value', e.status)})"
+                    for e in not_pending
+                )
+            )
+
+        entries = [by_id[i] for i in ids]
 
         flow_ids = {e.flow_id for e in entries}
         if len(flow_ids) != 1:
@@ -362,7 +399,11 @@ class ReconciliationService:
 
         flow_id = entries[0].flow_id
         currency = entries[0].currency
-        reco_id = next((e.reco_id for e in entries if e.reco_id), None)
+        # Label the group with a reco_id only when the basket is unambiguous.
+        # A basket deliberately spans several recos — picking the first non-null
+        # one, as this used to, files the group under an arbitrary member.
+        distinct_recos = {e.reco_id for e in entries if e.reco_id}
+        reco_id = next(iter(distinct_recos)) if len(distinct_recos) == 1 else None
 
         mg = match_group_repository.create(
             db,
@@ -377,11 +418,21 @@ class ReconciliationService:
                 comment=comment,
             ),
         )
-        reconciliation_entry_repository.mark_forced(
-            db, entry_ids=entry_ids, match_group_id=mg.id
+        marked = reconciliation_entry_repository.mark_forced(
+            db, entry_ids=ids, match_group_id=mg.id
         )
+        if marked != len(ids):
+            # An entry left PENDING between the check above and the update — the
+            # group would be short a leg and no longer sum to zero. Put the rows
+            # back and drop the group rather than émarger a broken match.
+            reconciliation_entry_repository.revert_forced(db, match_group_id=mg.id)
+            match_group_repository.delete(db, match_group_id=mg.id)
+            raise ValueError(
+                f"only {marked} of {len(ids)} entries could be forced — some were "
+                "reconciled concurrently; refresh and try again"
+            )
         # Move forced entries to émargement
-        reconciliation_entry_repository.move_to_emargement(db, entry_ids=entry_ids)
+        reconciliation_entry_repository.move_to_emargement(db, entry_ids=ids)
         return mg
 
     # --------------------------------------------------------------

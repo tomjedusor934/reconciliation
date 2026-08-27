@@ -137,7 +137,7 @@ class _Key:
 
 
 class _Member:
-    def __init__(self, lot_id, external_ref, keys, currency="EUR", split_parent=None):
+    def __init__(self, lot_id, external_ref, keys, currency="EUR", claim=None):
         self.lot_id = lot_id
         self.movement_type = "SCTXB"
         self.external_ref = external_ref
@@ -150,7 +150,8 @@ class _Member:
         self.transaction_particulars = None
         self.ref_no = None
         self.remarks_1 = None
-        self.split_parent_external_ref = split_parent
+        self.claim_key_type = claim[0] if claim else None
+        self.claim_key_value = claim[1] if claim else None
         self.payment_count = None
         self.keys = keys
 
@@ -218,6 +219,19 @@ def captured(monkeypatch):
         seen["synthetic_lot_ids"] = set(lot_ids)
 
     monkeypatch.setattr(movement_lot_repository, "sync_synthetic_only", _sync_synthetic)
+
+    # Ghost members resolve their claim group's canonical through movement_split;
+    # tests override ``canonicals`` to stand in for the stored groups.
+    from app.repositories.movement_split_repository import movement_split_repository
+
+    seen["canonicals"] = {}
+    monkeypatch.setattr(
+        movement_split_repository,
+        "resolve_group_canonicals",
+        lambda db, *, flow_source_id, claims: {
+            c: seen["canonicals"][c] for c in claims if c in seen["canonicals"]
+        },
+    )
     return seen
 
 
@@ -295,11 +309,20 @@ def test_member_keys_are_all_written(captured):
 
 
 def test_ghost_members_carry_a_derived_parent_hash(captured):
-    """The DAG cannot hash anything, so it sends the parent's external_ref and
-    the service derives the hash with the SAME formula split_service used when
-    it registered the parent — otherwise a ghost would point at nothing."""
+    """The DAG cannot hash anything, so it sends the ghost's claim key and the
+    service resolves the group's canonical parent from movement_split — the
+    SAME anchor split_service used for the ghost entry. Otherwise a ghost
+    member would point at nothing."""
+    from types import SimpleNamespace
+
     db = _FakeSession()
     lot_id = "55555555-5555-4555-8555-555555555555"
+    canonical = SimpleNamespace(
+        claim_key_type="MSGID", claim_key_value="PTEL-X",
+        source_hash="f" * 64, external_ref="TX1",
+        account="0010130015001", value_date=NOW, operation_date=NOW,
+    )
+    captured["canonicals"] = {("MSGID", "PTEL-X"): canonical}
 
     lot_service.apply_lot_batch(
         db,
@@ -307,18 +330,41 @@ def test_ghost_members_carry_a_derived_parent_hash(captured):
         source=_Source(),
         lots=[_Lot(lot_id)],
         members=[
-            _Member(lot_id, "TX1~aaaa", [_Key("PO", "po-1")], split_parent="TX1"),
+            _Member(lot_id, "KEY:PTEL-X~aaaa", [_Key("PO", "po-1")],
+                    claim=("MSGID", "PTEL-X")),
             _Member(lot_id, "TX2", [_Key("PO", "po-2")]),  # a real movement
         ],
     )
 
     rows = captured["member_rows"]
-    ghost = next(r for r in rows if r["external_ref"] == "TX1~aaaa")
+    ghost = next(r for r in rows if r["external_ref"] == "KEY:PTEL-X~aaaa")
     real = next(r for r in rows if r["external_ref"] == "TX2")
     assert real["split_parent_hash"] is None
-    assert ghost["split_parent_hash"] == lot_service.member_to_source_hash(
-        flow_id=_Flow.id, external_ref="TX1", account="0010130015001",
+    assert ghost["split_parent_hash"] == canonical.source_hash
+    # It is the CANONICAL's hash, not the ghost's own.
+    assert ghost["split_parent_hash"] != ghost["source_hash"]
+
+
+def test_a_ghost_whose_group_is_unknown_still_lands_unlinked(captured):
+    """A lost split push must not fail the lot batch: the member is hashed on
+    its wire fields and simply carries no parent link."""
+    db = _FakeSession()
+    lot_id = "66666666-6666-4666-8666-666666666666"
+
+    lot_service.apply_lot_batch(
+        db,
+        flow=_Flow(),
+        source=_Source(),
+        lots=[_Lot(lot_id)],
+        members=[
+            _Member(lot_id, "KEY:LOST~bbbb", [_Key("PO", "po-1")],
+                    claim=("MSGID", "LOST")),
+        ],
+    )
+
+    row = captured["member_rows"][0]
+    assert row["split_parent_hash"] is None
+    assert row["source_hash"] == lot_service.member_to_source_hash(
+        flow_id=_Flow.id, external_ref="KEY:LOST~bbbb", account="0010130015001",
         value_date=NOW, operation_date=NOW,
     )
-    # It is the PARENT's hash, not the ghost's own.
-    assert ghost["split_parent_hash"] != ghost["source_hash"]

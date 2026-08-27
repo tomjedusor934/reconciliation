@@ -46,7 +46,6 @@ const isAggregate = computed(() => detail.value?.members_included === false);
 /** What the bucket stands for, e.g. "26070613550600068 × LUXEMBOURG". */
 const bucketLabel = computed(() => {
   if (!lot.value || lot.value.bucket_kind === 'LEGACY') return null;
-  if (lot.value.bucket_kind === 'RESIDUAL') return 'Unexplained remainder of a split';
   const parts = [lot.value.bucket_pacs008, lot.value.bucket_msgid, lot.value.bucket_po].filter(
     Boolean
   );
@@ -190,11 +189,17 @@ onMounted(fetchDetail);
           {{ lot.is_balanced ? 'Balanced' : 'Unbalanced' }}
         </Badge>
         <Badge v-if="lot.currencies.length > 1" variant="danger">multi-currency</Badge>
-        <Badge v-if="lot.bucket_kind === 'RESIDUAL'" variant="danger">residual</Badge>
+        <Badge
+          v-if="lot.parent_mismatch"
+          variant="danger"
+          title="A slice here belongs to a claim group whose movements do not add up to their slices — even matched, this lot is not fully validated"
+        >
+          parent mismatch
+        </Badge>
         <Badge
           v-if="lot.synthetic_only"
           variant="info"
-          title="Every movement here is a slice of a batch, so the bucket nets to zero by construction — the real proof is each parent's conservation"
+          title="Every movement here is a slice of a batch, so the bucket nets to zero by construction — the real proof is the claim group's reconciliation"
         >
           proven by construction
         </Badge>
@@ -208,6 +213,14 @@ onMounted(fetchDetail);
   <div v-if="loading" class="flex justify-center py-10"><Loader size="lg" /></div>
 
   <template v-else-if="detail && lot">
+    <Card v-if="lot.parent_mismatch" class="mb-4 border-orange-300 bg-orange-50">
+      <div class="flex items-center gap-2 text-orange-800 text-sm">
+        <AlertTriangle class="h-4 w-4 shrink-0" />
+        A slice in this lot belongs to a claim group whose real movements do not add up to their
+        slices — even if the lot matches, it cannot be fully validated. Open the slice's split
+        drawer to see the group's delta.
+      </div>
+    </Card>
     <Card v-if="lot.merge_conflict" class="mb-4 border-amber-300 bg-amber-50">
       <div class="flex items-center gap-2 text-amber-800 text-sm">
         <AlertTriangle class="h-4 w-4 shrink-0" />

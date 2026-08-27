@@ -423,6 +423,38 @@ class FinacleDBExtractor(BaseParser):
 
 ---
 
+### 6. WERO datamart extraction — `shared/dags/reco_wero.py` (no parser class)
+
+**Purpose**: the WERO **payment** reconciliation — the datamart WERO table
+against `std.Payment` and `std.[Return]`, joined on the end-to-end reference.
+`std.Movement` is never read.
+
+Like `finacle_db` and `finacle_batch_booking_true`, `wero` is a `parser_type`
+with **no `BaseParser` subclass and no `get_parser()` entry**: `get_parser()` is
+only reached by FILE sources. The work happens in the Airflow DAG, which pushes
+entries through the ordinary `/tasks/finacle/runs/{id}/batch` lifecycle.
+
+Unlike the other two, its `parser_config` **is** used — every datamart
+identifier it interpolates comes from there (two of them are still unconfirmed
+against the real datamart), so retuning is a UI edit rather than a redeploy.
+Full key reference: [`PARSER-CONFIG.md`](PARSER-CONFIG.md) §9.
+
+It emits one entry per leg, all legs of a payment sharing the same `reco_id`,
+**WERO side credit / Finacle side debit**, so the existing sum-to-zero engine
+reconciles them with no change. A return and its WERO reversal get their own
+group under a `#RET` suffix.
+
+```
+WERO table    -> reco_id = normalize(OriginatorReference)      amount = +X
+std.Payment   -> reco_id = normalize(<payment_e2e_column>)     amount = -X
+std.[Return]  -> reco_id = normalize(e2e of OriginalPo) + #RET amount = -X
+```
+
+DAGs: `ingest_wero` (dedicated, paused at creation) and the `ingest_wero` step
+of the `reconciliation` orchestrator. Tests: `backend/tests/test_wero_dag.py`.
+
+---
+
 ## Ingestion Workflow
 
 **Endpoint**: `POST /tasks/ingest/{flow_code}`
@@ -531,8 +563,22 @@ When a new file format arrives:
        XML = "xml"
        MT940 = "mt940"
        FINACLE_DB = "finacle_db"
+       FINACLE_BATCH_BOOKING_TRUE = "finacle_batch_booking_true"
+       EXCEL = "excel"
+       WERO = "wero"
        NEW_FORMAT = "new_format"  # ADD THIS
    ```
+
+   A native PG enum label must also be added idempotently for already-deployed
+   databases — append it to `_PARSER_TYPE_LABELS` in
+   `backend/app/db/init_reco.py` (the label is the enum **NAME**, uppercase),
+   and ship the matching alembic migration. Skipping this is why a new parser
+   type works on a fresh DB and fails on an existing one.
+
+   Datamart parser types (`finacle_db`, `finacle_batch_booking_true`, `wero`)
+   stop at steps 3 and 4: they have no parser class and no factory entry, and
+   the extraction lives in a DAG module under `shared/dags/` that self-selects
+   on `parser_type` from `GET /tasks/finacle/sources`.
 
 4. **Test locally**:
    - Create test file in `shared/inbox/flow_code/`

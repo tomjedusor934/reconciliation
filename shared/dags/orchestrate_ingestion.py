@@ -24,6 +24,7 @@ from reco_common import (
 from reco_datamart import run_finacle_ingestion
 from reco_datamart_bb import run_finacle_bb_ingestion
 from reco_payment_status import run_payment_status_sync
+from reco_wero import run_wero_ingestion
 from mt940_extract import run_mt940_ingestion
 
 default_args = {
@@ -123,6 +124,24 @@ def _ingest_finacle_bb(**context):
         raise
 
 
+def _ingest_wero(**context):
+    """Datamart extraction for WERO sources (payment reconciliation: the WERO
+    table against std.Payment / std.[Return] — shared with the dedicated
+    ingest_wero DAG).
+
+    Skips gracefully if no MSSQL ODBC driver is available; a missing WERO source
+    is already a clean no-op inside run_wero_ingestion.
+    """
+    try:
+        return run_wero_ingestion(dag_run_id=context["run_id"])
+    except Exception as exc:
+        exc_str = str(exc)
+        if "No supported MSSQL ODBC driver" in exc_str or "file not found" in exc_str:
+            print(f"[orchestrate_ingestion] WERO step skipped: {exc_str}")
+            return {"skipped": True, "reason": "odbc_driver_not_found"}
+        raise
+
+
 def _sync_payment_status(**context):
     """std.Payment status sync for every finacle movement (payment-status
     column of the operational view). Runs AFTER the finacle ingests so the
@@ -154,6 +173,11 @@ with dag:
     ingest_finacle_bb = PythonOperator(
         task_id="ingest_finacle_bb",
         python_callable=_ingest_finacle_bb,
+    )
+
+    ingest_wero = PythonOperator(
+        task_id="ingest_wero",
+        python_callable=_ingest_wero,
     )
 
     ingest_mt940 = PythonOperator(
@@ -192,7 +216,10 @@ with dag:
 
     # Finacle datamart extraction first (so MT940 reco_id resolution / the backend
     # pre-match sweep can lean on ingested finacle entries), then the batch-booking
-    # lot clustering, then MT940 file extraction, then the remaining file flows,
-    # then the payment-status sync (needs the finacle entries ingested), then
-    # reconcile + sweep.
-    ingest_finacle >> ingest_finacle_bb >> ingest_mt940 >> ingest_all >> sync_payment_status >> auto_reconcile >> sweep_emargement
+    # lot clustering, then WERO, then MT940 file extraction, then the remaining
+    # file flows, then the payment-status sync (needs the finacle entries
+    # ingested), then reconcile + sweep.
+    # WERO depends on none of the others (its reco_id comes straight off the
+    # payment references, not from std.Movement); it sits here only to keep the
+    # chain linear, and only has to precede auto_reconcile.
+    ingest_finacle >> ingest_finacle_bb >> ingest_wero >> ingest_mt940 >> ingest_all >> sync_payment_status >> auto_reconcile >> sweep_emargement

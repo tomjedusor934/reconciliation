@@ -203,9 +203,100 @@ These sources are **not** file-parsed. The `ingest_finacle` Airflow DAG pulls
 `reco_id` itself. The `parser_config` is unused (`{}`). See
 [`04-AIRFLOW.md`](04-AIRFLOW.md).
 
+Same for `finacle_batch_booking_true`: same source type, no `parser_config`, but
+the `ingest_finacle_bb` DAG buckets the movements into lots and `reco_id` is the
+lot uuid.
+
 ---
 
-## 9. Tips
+## 9. `wero` (datamart, `parser_config` **used**)
+
+Also a `finacle_db` **source type**, but the only datamart parser whose
+`parser_config` matters — and the only flow that is a **payment**
+reconciliation rather than an accounting one. `std.Movement` is never read.
+
+The `ingest_wero` DAG (`shared/dags/reco_wero.py`) streams three legs and pushes
+one entry each, all legs of a payment sharing the same `reco_id` (the
+**end-to-end reference**, normalised):
+
+| Leg | Source | `event_type` | Sign |
+|---|---|---|---|
+| WERO payment | the datamart WERO table | `WERO` | **credit `+X`** |
+| WERO reversal | same, rows in `wero_reversal_statuses` | `WERO_RVSL` | credit `+X`, `reco_id` suffixed `#RET` |
+| Finacle payment | `std.Payment` filtered on `InitModule` | `PAYMENT` | **debit `−X`** |
+| Finacle return | `std.[Return]` → its original payment | `RETURN` | debit `−X`, `reco_id` suffixed `#RET` |
+
+The standard sum-to-zero engine then reconciles them with no change. What you
+read in the operational view:
+
+- pending **credit** → a WERO row with no Finacle counterpart
+- pending **debit** → a WERO payment in Finacle with no WERO row
+- two pending rows summing ≠ 0 → an amount discrepancy
+- `reco_id` NULL → a leg with no usable end-to-end reference
+
+The sign is a matching device, not an accounting statement: the business
+direction stays in `remarks_1` (`WERO/IN`, `P2P`, `EMC/RETURN`) and in
+`payload_raw`. A return and its WERO reversal form their own group under
+`#RET`, so an unmirrored return does not drag the reconciled original pair back
+to pending. The source carries **no reference account** — its perimeter is
+`InitModule`, not a GL account.
+
+**No reference account, and no `BaseParser` subclass**: like the other datamart
+types it is never routed through `get_parser()`.
+
+| Key | Default | Notes |
+|---|---|---|
+| `wero_table` | `std.Wero` | **confirmed on production 2026-08-26**; schema-qualified name accepted |
+| `wero_ref_column` | `OriginatorReference` | the end-to-end reference |
+| `wero_id_column` | `CaptureIDMoneyTransferID` | feeds `external_ref` / `ref_no` |
+| `wero_date_column` | `SettlementRelatedTimestamp` | business date (a varchar in the datamart) |
+| `wero_watermark_column` | `StartDate` | incremental filter — a real DATE, deliberately not the varchar above |
+| `wero_amount_column` | `TransactionAmount` | varchar; `125,00` and `1 250.55` are accepted, `0` and unparsable are row errors |
+| `wero_currency_column` | `Currency` | |
+| `wero_direction_column` | `TransactionDirection` | goes to `remarks_1`, never to the sign |
+| `wero_status_column` | `SettlementStatus` | goes to `transaction_particulars` |
+| `wero_reversal_statuses` | `[]` | **confirmed 2026-08-26: no reversal status exists** (only Accepted / Failed / Rejected / Settled). Stays empty ⇒ **no reversal leg emitted** |
+| `wero_settlement_statuses` | `[]` | whitelist of statuses worth reconciling; empty = all (no filtering). Applied in SQL, not when mapping the row |
+| `payment_e2e_column` | `EndToEndId` | **confirmed on production 2026-08-26** — the datamart's `endtoendidentification` |
+| `payment_init_modules` | `["WERO","WEROEMC"]` | the perimeter; also gives P2P vs EMC |
+| `payment_date_column` | `CreatedOn` | |
+| `payment_currency_column` | `null` | `null` → `default_currency`. Held there: std.Payment carries two currency families (`SettlementCurrency` / `SettlementCcy`) and currency is part of the match key |
+| `return_date_column` | `null` | `null` → the original payment's date **and** watermark. `CreatedOn` / `SettlementDate` exist but an empty date makes every return a row error |
+| `return_amount_column` | `null` | `null` → the original payment's `SettlementAmount`. `ReturnSettlementAmount` exists but an empty amount raises in `parse_amount` |
+| `return_status_column` | `Status` | **confirmed 2026-08-26**, and risk-free: only feeds `transaction_particulars` |
+| `returns_enabled` | `true` | |
+| `default_currency` | `EUR` | |
+
+Every identifier is validated as a bare (optionally schema-qualified) SQL
+identifier when the config loads: these values reach SQL by interpolation
+because a column name cannot be a bind parameter. List values are bound.
+
+Both guessed identifiers are **confirmed on production (2026-08-26)**:
+`std.Wero` and `std.Payment.EndToEndId`. Three keys stay `null` on purpose —
+`payment_currency_column`, `return_amount_column`, `return_date_column`: their
+columns **exist** but are not known to be **populated**, and each one feeds the
+currency (part of the match group key) or the amount, where an empty value
+breaks matching silently or turns every return into a row error. The queries in
+[`wero-datamart-diagnostics.sql`](wero-datamart-diagnostics.sql) unblock them —
+and setting them stays a UI edit, never a DAG redeploy.
+
+Still open: `std.Wero` carries no reversal status, so a Finacle `std.[Return]`
+has no WERO counterpart today and sits in pending debit under `#RET` — visible
+and unmatched, which is the truthful signal. Diagnostics query C settles it.
+
+The WERO flow is seeded **inactive**: production `std.Wero` was still empty on
+2026-08-26 (the datamart table is loaded downstream of the ODS
+`WERO.RECONCILIATION`), while `std.Payment` already carried 21 `WERO` + 3
+`WEROEMC` payments. Diagnostics query E tells the two situations apart.
+
+**Reference normalisation** — one function, used on all three sides: `upper()`
+(MSSQL's collation is case-insensitive, Python's comparison is not), then
+dashes dropped **only** when the result is a 32-hex-digit UUID (WERO stores the
+transfer id with dashes, Finacle sometimes without).
+
+---
+
+## 10. Tips
 
 - **Matching**: the file side and its finacle/GL counterpart must produce the
   **same `reco_id`** and **opposite-signed amounts** for a group to net to 0.

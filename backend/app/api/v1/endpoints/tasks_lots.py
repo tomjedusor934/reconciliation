@@ -38,19 +38,20 @@ def push_split_batch(
     db: Session = Depends(deps.get_db),
     _: None = Depends(deps.verify_internal_token),
 ):
-    """Register the movements replaced by ghosts, and withdraw them.
+    """Register each claim group's parents, materialise its ghosts, withdraw
+    the real movements.
 
-    Pushed BEFORE the lot batch: the real movement must be out of
-    ``reconciliation_entry`` before its ghosts are counted as lot members, so no
-    intermediate state has both. Also reaps the ghosts a parent no longer
-    produces (a bucket that disappeared between two runs).
+    Pushed BEFORE the lot batch: the real movements must be out of
+    ``reconciliation_entry`` before the group's ghosts are counted as lot
+    members, so no intermediate state has both. Also reaps the ghosts a group
+    no longer produces (a bucket that disappeared between two runs).
     """
     flow, source = _resolve_source(
         db, flow_code=payload.flow_code, source_code=payload.source_code
     )
     try:
         result = split_service.apply_split_batch(
-            db, flow=flow, source=source, parents=payload.parents, run_id=payload.run_id
+            db, flow=flow, source=source, groups=payload.groups, run_id=payload.run_id
         )
     except ValueError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))

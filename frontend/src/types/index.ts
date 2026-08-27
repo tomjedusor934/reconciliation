@@ -141,7 +141,8 @@ export type ParserType =
   | 'mt940'
   | 'finacle_db'
   | 'finacle_batch_booking_true'
-  | 'excel';
+  | 'excel'
+  | 'wero';
 export type MatchKeyStrategy = 'reco_id_amount' | 'file_ref_amount' | 'ref_amount';
 
 export interface FlowSourceAccount {
@@ -216,6 +217,47 @@ export interface ReconciliationEntry {
   payment_statuses?: Record<string, number> | null;
 }
 
+// ── Manual match basket (client-side, localStorage) ─────────────────
+
+/**
+ * One entry parked in a basket. A trimmed snapshot of ReconciliationEntry —
+ * enough to review and total the basket offline, without the heavy fields
+ * (payload_raw, payment_statuses) that would blow the localStorage quota.
+ */
+export interface BasketItem {
+  id: number;
+  flow_id: number;
+  currency: string;
+  amount: string;
+  reco_id?: string | null;
+  account?: string | null;
+  value_date: string;
+  ref_no?: string | null;
+  remarks_1?: string | null;
+  transaction_particulars?: string | null;
+  /** Filled by the basket's refresh(): anything but 'pending' means the row
+   *  moved on (auto-matched, excluded…) and can no longer be forced. */
+  current_status?: EntryStatus;
+  /** refresh() found no such entry server-side any more (purged re-ingest,
+   *  parent withdrawn by a split…). */
+  missing?: boolean;
+}
+
+/**
+ * A working set of entries being assembled across several searches. flow_id and
+ * currency are null until the first item lands, then they are locked — the
+ * backend refuses a group spanning several flows or currencies.
+ */
+export interface Basket {
+  id: string;
+  name: string;
+  flow_id: number | null;
+  currency: string | null;
+  items: BasketItem[];
+  created_at: string;
+  updated_at: string;
+}
+
 export interface MatchGroup {
   id: number;
   flow_id: number;
@@ -234,10 +276,9 @@ export interface MatchGroup {
 export type LotStatus = 'pending' | 'matched' | 'merged';
 export type LotKeyType = 'PACS008' | 'MSGID' | 'PO';
 // What a lot stands for. A lot IS a (PACS008 × MSGID) bucket; the degraded
-// kinds cover payments missing one side, RESIDUAL is legacy — it held what a
-// split could not
-// explain, and LEGACY marks the lots inherited from the retired clustering.
-export type BucketKind = 'PAIR' | 'PACS_ONLY' | 'MSGID_ONLY' | 'PO' | 'RESIDUAL' | 'LEGACY';
+// kinds cover payments missing one side, and LEGACY marks the lots inherited
+// from the retired clustering.
+export type BucketKind = 'PAIR' | 'PACS_ONLY' | 'MSGID_ONLY' | 'PO' | 'LEGACY';
 
 export interface LotSummary {
   lot_id: string;
@@ -266,8 +307,11 @@ export interface LotSummary {
   bucket_po?: string | null;
   bucket_ref?: string | null;
   // Every member is a ghost → the lot nets to zero by construction and proves
-  // nothing on its own; the evidence is the parent conservation in /splits.
+  // nothing on its own; the evidence is the claim-group check in /splits.
   synthetic_only: boolean;
+  // The lot carries a ghost of a claim group whose parents do not add up to
+  // its ghosts (second reconciliation) — matched or not, not fully validated.
+  parent_mismatch: boolean;
   created_at: string;
   updated_at: string;
 }
@@ -372,7 +416,7 @@ export interface PaginatedLotKeyValuesResponse {
   total_count: number;
 }
 
-// ── Movement splits (a real movement and the ghosts that replaced it) ───
+// ── Movement splits (claim groups and the ghosts that stand for them) ───
 
 export interface SplitParent {
   source_hash: string;
@@ -390,10 +434,13 @@ export interface SplitParent {
   remarks_1?: string | null;
   payment_count: number;
   // Above 1, several movements claim the same payment group (Finacle booked one
-  // batch as N entries): the allocation is weighted on a shared basis.
+  // batch as N entries): the group reconciliation is the meaningful control.
   shared_key_movements: number;
-  // The real movement was already émargé and could not be withdrawn: its ghosts
-  // double count against it until an operator arbitrates.
+  // The claim group this parent belongs to (ghosts are emitted per group).
+  claim_key_type?: string | null;
+  claim_key_value?: string | null;
+  // The real movement was already émargé and could not be withdrawn: its
+  // group's ghosts double count against it until an operator arbitrates.
   parent_emarged: boolean;
 }
 
@@ -417,23 +464,37 @@ export interface SplitChild {
   synthetic_only: boolean;
 }
 
-// Two distinct controls, deliberately not mixed. Conservation: the ghosts share
-// out the movement's own amount, so missing_amount is 0 unless one was removed
-// out of band. Data quality: payment_gap is what finacle booked minus what
-// std.Payment accounts for — a signal about the datamart, never a hole.
-export interface SplitConservation {
-  parent_amount: string;
-  children_amount: string;
-  missing_amount: string;
+// A parent of the same claim group, compact (the group list in the drawer).
+export interface SplitSibling {
+  source_hash: string;
+  movement_type: string;
+  external_ref?: string | null;
+  amount: string;
+  currency: string;
+  value_date: string;
+  parent_emarged: boolean;
+}
+
+// The claim group's reconciliation — the control that replaced per-parent
+// conservation. delta ≠ 0 means the booked movements and the ghosts standing
+// for them do not add up: every lot carrying one of the group's ghosts is
+// tagged parent_mismatch by the reconcile run.
+export interface SplitGroup {
+  claim_key_type: string;
+  claim_key_value: string;
+  canonical_source_hash?: string | null;
+  parents: SplitSibling[];
+  parent_total: string;
+  children_total: string;
+  delta: string;
+  // Σ SettlementAmount the group's payments account for (informational).
   payment_amount: string;
-  payment_gap: string;
-  child_count: number;
 }
 
 export interface SplitDetail {
   parent: SplitParent;
+  group: SplitGroup;
   children: SplitChild[];
-  conservation: SplitConservation;
 }
 
 export interface ForceMatchRequest {

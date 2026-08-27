@@ -24,6 +24,7 @@ from app.models.reconciliation_entry import (
     ReconciliationEntry,
     ReconciliationEntryEmargement,
 )
+from app.repositories.movement_split_repository import movement_split_repository
 
 
 class ReconciliationEntryRepository:
@@ -101,6 +102,13 @@ class ReconciliationEntryRepository:
         ``std.Payment`` amounts, which grows as the datamart fills in, so
         ``amount``/``direction`` are refreshed for rows carrying a
         ``split_parent_hash`` and left frozen for everything else.
+
+        TWO KINDS OF ROW ARE NOT RE-INSERTED. An entry already moved to the
+        émargement table is immutable. And a movement that was WITHDRAWN in
+        favour of its ghosts must not come back: it was deleted on purpose, and
+        re-inserting it makes the flow count the movement AND the ghosts that
+        stand for it (see ``parents_still_replaced``). Both are counted as
+        skipped.
         """
         if not rows:
             return 0, 0, 0
@@ -116,6 +124,20 @@ class ReconciliationEntryRepository:
         if existing_emargement:
             rows = [r for r in rows if r["source_hash"] not in existing_emargement]
             skipped = len(incoming_hashes) - len(rows)
+        if not rows:
+            return 0, 0, skipped
+
+        replaced = movement_split_repository.parents_still_replaced(
+            db, source_hashes=[r["source_hash"] for r in rows]
+        )
+        if replaced:
+            before = len(rows)
+            rows = [r for r in rows if r["source_hash"] not in replaced]
+            skipped += before - len(rows)
+            logger.warning(
+                "upsert_finacle: %d movement(s) replaced by their ghosts — not "
+                "re-inserted (e.g. %s)", len(replaced), sorted(replaced)[:3],
+            )
         if not rows:
             return 0, 0, skipped
 
@@ -439,11 +461,32 @@ class ReconciliationEntryRepository:
             q = q.filter(ReconciliationEntry.value_date == value_date)
         return q.first()
 
+    def get_many(
+        self, db: Session, *, entry_ids: Sequence[int]
+    ) -> List[ReconciliationEntry]:
+        """Live-table rows for a set of ids, in one query.
+
+        The live table is where PENDING lives, so an id missing from the result
+        is either gone or already émargé — which is all a force needs to know.
+        Chunked: a match basket can hand over thousands of ids."""
+        if not entry_ids:
+            return []
+        rows: List[ReconciliationEntry] = []
+        ids = list(entry_ids)
+        for i in range(0, len(ids), self._IN_CHUNK):
+            rows += (
+                db.query(ReconciliationEntry)
+                .filter(ReconciliationEntry.id.in_(ids[i:i + self._IN_CHUNK]))
+                .all()
+            )
+        return rows
+
     def _apply_entry_filters(
         self,
         q,
         model,
         *,
+        ids=None,
         flow_id=None,
         status=None,
         reco_id=None,
@@ -459,6 +502,11 @@ class ReconciliationEntryRepository:
     ):
         """Shared WHERE builder for the operational list + count (same clauses,
         one place so they can't drift)."""
+        # Explicit id set — how a client re-reads the state of rows it already
+        # knows about (a match basket). An empty list means "nothing", not "no
+        # filter", so test against None.
+        if ids is not None:
+            q = q.filter(model.id.in_(ids))
         if flow_id is not None:
             q = q.filter(model.flow_id == flow_id)
         if status is not None:
@@ -533,6 +581,7 @@ class ReconciliationEntryRepository:
         self,
         db: Session,
         *,
+        ids: Optional[Sequence[int]] = None,
         flow_id: Optional[int] = None,
         status: Optional[EntryStatus] = None,
         reco_id: Optional[str] = None,
@@ -550,6 +599,7 @@ class ReconciliationEntryRepository:
     ) -> List[ReconciliationEntry]:
         models = self._entry_models_for_status(status)
         kw = dict(
+            ids=ids,
             flow_id=flow_id, status=status, reco_id=reco_id,
             amount_min=amount_min, amount_max=amount_max,
             payment_statuses=payment_statuses,
@@ -583,6 +633,7 @@ class ReconciliationEntryRepository:
         self,
         db: Session,
         *,
+        ids: Optional[Sequence[int]] = None,
         flow_id: Optional[int] = None,
         status: Optional[EntryStatus] = None,
         reco_id: Optional[str] = None,
@@ -599,6 +650,7 @@ class ReconciliationEntryRepository:
         """Count total entries matching filters (for pagination)."""
         models = self._entry_models_for_status(status)
         kw = dict(
+            ids=ids,
             flow_id=flow_id, status=status, reco_id=reco_id,
             amount_min=amount_min, amount_max=amount_max,
             payment_statuses=payment_statuses,
@@ -725,6 +777,29 @@ class ReconciliationEntryRepository:
         db.commit()
         return count
 
+    def revert_forced(self, db: Session, *, match_group_id: int) -> int:
+        """Put a forced group's entries back to PENDING.
+
+        Undoes a mark_forced that could not cover every requested id — the group
+        would be short a leg and no longer sum to zero, so it must not survive."""
+        count = (
+            db.query(ReconciliationEntry)
+            .filter(
+                ReconciliationEntry.match_group_id == match_group_id,
+                ReconciliationEntry.status == EntryStatus.FORCED,
+            )
+            .update(
+                {
+                    "status": EntryStatus.PENDING,
+                    "match_group_id": None,
+                    "matched_at": None,
+                },
+                synchronize_session=False,
+            )
+        )
+        db.commit()
+        return count
+
     def mark_excluded(
         self, db: Session, *, entry_id: int
     ) -> int:
@@ -797,9 +872,18 @@ class ReconciliationEntryRepository:
         """Move non-pending entries from the live table to the émargement table."""
         if not entry_ids:
             return 0
+        ids = list(entry_ids)
+        # The id list is interpolated into the statement text (ints, so not
+        # injectable) — chunk it so a large basket cannot build one enormous
+        # statement.
+        if len(ids) > self._IN_CHUNK:
+            return sum(
+                self.move_to_emargement(db, entry_ids=ids[i:i + self._IN_CHUNK])
+                for i in range(0, len(ids), self._IN_CHUNK)
+            )
         now = datetime.now(timezone.utc)
         # Use CTE: DELETE … RETURNING → INSERT into émargement
-        placeholders = ", ".join(str(int(eid)) for eid in entry_ids)
+        placeholders = ", ".join(str(int(eid)) for eid in ids)
         sql = text(f"""
             WITH moved AS (
                 DELETE FROM reco.reconciliation_entry

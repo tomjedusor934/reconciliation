@@ -61,6 +61,11 @@ class MovementLotRepository:
 
         ``buckets`` carries ``lot_id`` plus the identity the uuid5 was derived
         from, so the row records what it stands for and not just an opaque id.
+
+        Stored VERBATIM — no normalisation here. The DAG folds the identity to
+        upper case before deriving the uuid5 (see ``BucketKey`` in
+        reco_datamart_bb), so touching the components backend-side could only put
+        them out of step with the id they produced. This is a faithful recorder.
         """
         if not buckets:
             return 0
@@ -228,7 +233,7 @@ class MovementLotRepository:
         SELECT l.id, l.flow_id, l.flow_source_id, l.currency, l.status AS lot_status,
                l.merged_into_lot_id, l.merged_at, l.merge_conflict, l.created_at, l.updated_at,
                l.bucket_kind, l.bucket_pacs008, l.bucket_msgid, l.bucket_po, l.bucket_ref,
-               l.synthetic_only,
+               l.synthetic_only, l.parent_mismatch,
                COALESCE(agg.member_count, 0) AS member_count,
                COALESCE(agg.total_debit, 0) AS total_debit,
                COALESCE(agg.total_credit, 0) AS total_credit,
@@ -294,6 +299,7 @@ class MovementLotRepository:
         bucket_kind: Optional[str] = None,
         synthetic_only: Optional[bool] = None,
         payment_gap: Optional[bool] = None,
+        parent_mismatch: Optional[bool] = None,
     ) -> Tuple[str, Dict[str, Any]]:
         """(outer WHERE clause over the aggregated subquery, bind params)."""
         clauses: List[str] = []
@@ -310,6 +316,9 @@ class MovementLotRepository:
         if synthetic_only is not None:
             clauses.append("synthetic_only = :synthetic_only")
             params["synthetic_only"] = synthetic_only
+        if parent_mismatch is not None:
+            clauses.append("parent_mismatch = :parent_mismatch")
+            params["parent_mismatch"] = parent_mismatch
         if payment_gap is not None:
             # Lots holding a ghost whose movement's booked amount disagrees with
             # what std.Payment accounts for. Scoped through the lot's own members
@@ -363,6 +372,7 @@ class MovementLotRepository:
         bucket_kind: Optional[str] = None,
         synthetic_only: Optional[bool] = None,
         payment_gap: Optional[bool] = None,
+        parent_mismatch: Optional[bool] = None,
         skip: int = 0,
         limit: int = 50,
     ) -> Tuple[List[Any], int]:
@@ -370,7 +380,7 @@ class MovementLotRepository:
             flow_id=flow_id, status=status, balanced=balanced,
             date_from=date_from, date_to=date_to, search=search,
             bucket_kind=bucket_kind, synthetic_only=synthetic_only,
-            payment_gap=payment_gap,
+            payment_gap=payment_gap, parent_mismatch=parent_mismatch,
         )
         base = f"SELECT * FROM ({self._LOT_SELECT}) AS lot_agg{where}"
         total = db.execute(

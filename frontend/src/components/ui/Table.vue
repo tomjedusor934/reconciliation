@@ -43,6 +43,10 @@ const props = withDefaults(defineProps<{
 const emit = defineEmits<{
   (e: 'row-click', item: Record<string, any>): void
   (e: 'page-change', page: number): void
+  // Rows left after this component's own search + column filters. Emitted so a
+  // parent can offer a "select all" that matches what is actually displayed —
+  // filteredAndSortedItems is internal state otherwise.
+  (e: 'visible-items', items: Record<string, any>[]): void
 }>();
 
 function handleRowClick(item: Record<string, any>, event: MouseEvent) {
@@ -481,6 +485,9 @@ const filteredAndSortedItems = computed(() => {
   return result;
 });
 
+// Keep the parent in step with what is on screen (see the 'visible-items' emit).
+watch(filteredAndSortedItems, (rows) => emit('visible-items', rows), { immediate: true });
+
 const paginatedItems = computed(() => {
   if (!props.pagination) return filteredAndSortedItems.value;
   const start = (currentPage.value - 1) * pageSize.value;
@@ -678,7 +685,8 @@ function stickyTdClasses(col: any) {
                     @dragend="onHeaderDragEnd"
                   >
                     <div class="flex items-center gap-1.5" :class="col.align === 'right' ? 'justify-end' : ''">
-                      <span>{{ col.label }}</span>
+                      <!-- Dynamic Slot for Header: header-key (named slot wins; else the label) -->
+                      <slot :name="`header-${col.key}`" :column="col">{{ col.label }}</slot>
                       <!-- Filter icon (funnel) -->
                       <button
                         v-if="!col.pinned"

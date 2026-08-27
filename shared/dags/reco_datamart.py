@@ -15,7 +15,7 @@ from decimal import Decimal
 import logging
 import os
 import re
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
 from reco_common import (
     finacle_complete_run,
@@ -67,11 +67,19 @@ if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", PAYMENT_AMOUNT_COL):
     )
 
 # reco_id classification from TransactionParticulars (see example/flow_schema.txt).
-INSTANT_PREFIXES = {"SWIFT", "SCRT1", "BKRTP"}       # ref_no filled -> instant payment
+INSTANT_PREFIXES = {"SWIFT", "SCRT1", "BKRTP", "REV SCRT1"}       # ref_no filled -> instant payment
 BULK_PREFIXES = {"SCTXB", "SDDXB", "SDXBB"}  # no ref_no -> bulk payment
 BULK_DIRECT_SEGS = {"I", "O"}                # PREFIX/I|O/...        -> remarks_1 (BLK)
-BULK_RETURN_SEGS = {"NCC", "NCP"}            # PREFIX/NCC|NCP/I|O/PO_ID/... -> std.Payment
-BULK_REJECT_SEGS = {"RCC"}                   # PREFIX/RCC/... reject -> std.[Return]
+# PREFIX/<SEG>/I|O/PO_ID/... — the return and reject shapes. Both name a
+# PaymentNumber in segment[3] (and in ref_no); the segment decides WHICH table
+# answers it. A shape missing from these sets does not fail loudly: it falls
+# through to the direct branch, which reads Remarks_1 AS a pacs008 — and on a
+# return Remarks_1 is the counterparty IBAN or a UUID. That is how RRS/RCP
+# minted 5 652 lots keyed on an IBAN or a UUID (90% of the PACS_ONLY lots on
+# the outward float) before they were listed here.
+BULK_RETURN_SEGS = {"NCC", "NCP", "RRS"}     # -> std.Payment (PO = the original payment)
+BULK_REJECT_SEGS = {"RCC", "RCP"}            # -> std.[Return] -> OriginalPo (PO = the return)
+RVSL_SEG = "RVSL"                            # PREFIX/RVSL/<TransactionRef>/<reason> — ref in segment[2]
 NDRT_PREFIX = "NDRT"                         # reject-of-return -> std.[Return]
 UNRESOLVED_RECO_ID = "Not Supported"         # known prefix, unhandled schema
 # MOSEL / Webripost movements have no '/'-structured TransactionParticulars
@@ -246,14 +254,25 @@ def _tp_parts(row: Dict[str, Any]) -> List[str]:
     return tp.split("/")
 
 
+def return_reject_seg(parts: Sequence[str]) -> Optional[str]:
+    """The return/reject segment of a ``PREFIX/<SEG>/I|O/PO_ID/...`` shape, else None.
+
+    Deliberately blind to the PREFIX: the SHAPE carries the key, not the label in
+    front of it. Finacle books the reversal of a return as
+    ``Rev of /NCP/O/<po>/<name>`` — same segment, same PaymentNumber in segment[3]
+    AND in ref_no, only the prefix is free text. Gating this on ``BULK_PREFIXES``
+    is what sent 347 of them to 'Not Supported' with the PO in plain sight.
+    """
+    if len(parts) < 2:
+        return None
+    seg = parts[1].strip().upper()
+    return seg if seg in BULK_RETURN_SEGS or seg in BULK_REJECT_SEGS else None
+
+
 def payment_po_id_for(record: Dict[str, Any]) -> Optional[str]:
-    """PO_ID needing a std.Payment lookup (bulk RETURN), else None."""
+    """PO_ID needing a std.Payment lookup (RETURN shape), else None."""
     parts = _tp_parts(record)
-    if (
-        len(parts) >= 4
-        and parts[0].strip().upper() in BULK_PREFIXES
-        and parts[1].strip().upper() in BULK_RETURN_SEGS
-    ):
+    if len(parts) >= 4 and parts[1].strip().upper() in BULK_RETURN_SEGS:
         return _clean(parts[3])
     return None
 
@@ -271,7 +290,10 @@ def instant_po_id_for(record: Dict[str, Any]) -> Optional[str]:
     parts = _tp_parts(record)
     if not parts or parts[0].strip().upper() not in INSTANT_PREFIXES:
         return None
-    return _clean(_dm_ref_no(record))
+    result = _clean(_dm_ref_no(record))
+    if not result and len(parts) > 3 and parts[0].strip().upper() == "REV SCRT1":
+        result = _clean(parts[3])
+    return result
 
 
 def return_po_id_for(record: Dict[str, Any]) -> Optional[str]:
@@ -284,12 +306,12 @@ def return_po_id_for(record: Dict[str, Any]) -> Optional[str]:
         return None
     prefix = parts[0].strip().upper()
     seg1 = parts[1].strip().upper() if len(parts) > 1 else ""
-    if prefix != NDRT_PREFIX and not (prefix in BULK_PREFIXES and seg1 in BULK_REJECT_SEGS):
+    if prefix != NDRT_PREFIX and seg1 not in BULK_REJECT_SEGS:
         return None
     ref = _clean(_dm_ref_no(record))
     if ref:
         return _clean(ref.split("##")[-1]) if "##" in ref else ref
-    if prefix in BULK_PREFIXES and len(parts) >= 4:
+    if seg1 in BULK_REJECT_SEGS and len(parts) >= 4:
         return _clean(parts[3])
     return None
 
@@ -325,6 +347,10 @@ def reversal_ref_for(record: Dict[str, Any]) -> Optional[str]:
         return None                                      # bulk direct — not a reversal
     if prefix in INSTANT_PREFIXES and _clean(_dm_ref_no(record)):
         return None                                      # normal instant payment (has ref_no)
+    if seg1 == RVSL_SEG and len(parts) > 2:
+        # SCTXB/RVSL/<TransactionRef>/<reason>: the marker occupies segment[1],
+        # so the ref is one segment further right than the usual shape.
+        return _clean(parts[2])
     return _clean(parts[1])
 
 
@@ -373,6 +399,10 @@ def compute_reco_id(
             # Bulk-booked instant payment (multiline & co) → the bulk's MessageID
             # groups all its members; a plain 1-1 instant keeps its own PO id.
             return (bulk_key_map or {}).get(ref, ref)
+        
+        if not ref and len(parts) > 3 and prefix == "REV SCRT1":
+            return _clean(parts[3])  # rev scrt& with no ref_no REV SCRT1/<TransactionRef>/O/PO_ID/... -> std.Payment
+
         # BKRTP can wear the bulk-return shape (BKRTP/NCC|NCP/I|O/PO_ID/...): it is
         # still an IP keyed by ref_no — parts[1] is a return segment, NOT a reversal
         # TransactionRef, so never attempt a reversal lookup for it.
@@ -394,6 +424,16 @@ def compute_reco_id(
         # flow (miss stays "Not Supported", exactly as before).
         return reversal_map.get(_clean(parts[1]) or "") or UNRESOLVED_RECO_ID
 
+    # Any other prefix wearing the return/reject shape — 'Rev of /NCP/O/<po>/…',
+    # the free-text label Finacle puts on the reversal of a return. Same segment,
+    # same PaymentNumber: resolved like its bulk twin above.
+    seg1 = parts[1].strip().upper()
+    if seg1 in BULK_REJECT_SEGS:
+        po = return_po_id_for(row)
+        return return_map.get(po) if po else None
+    if seg1 in BULK_RETURN_SEGS and len(parts) >= 4:
+        return payment_map.get(_clean(parts[3]) or "")
+
     # GL transfers, unknown patterns → still try a reversal lookup before giving up.
     return reversal_map.get(_clean(parts[1]) or "") or UNRESOLVED_RECO_ID
 
@@ -402,7 +442,11 @@ def resolve_bulk_returns(lookup_conn, po_ids) -> Dict[str, Optional[str]]:
     """Resolve all bulk-return PO_IDs in ONE pass: load them into a temp table and
     INNER JOIN std.Payment once (single scan), instead of hundreds of `IN` queries.
 
-    Returns {PaymentNumber: first non-empty of (MessageID, MessageIDPACS008)}.
+    Returns {PaymentNumber: first non-empty of (MessageIDPACS008, MessageID)} —
+    the PACS008 first, as the SQL below does. The order is not cosmetic: it is
+    the key the return legs of a bulk are filed under, so anything rebuilding
+    that link (see backend/app/services/rcp_link_service.py) must use the very
+    same one or its rows land in a group of their own.
     PO_IDs with no current payment are simply absent → reco stays None (transient).
     """
     result: Dict[str, Optional[str]] = {}

@@ -6,12 +6,20 @@ longer resolve member statuses. The entry path is
 ``tasks._to_parsed(FinacleEntryIn) → ParsedEntry.compute_finacle_hash`` — these
 tests run the REAL entry path against ``lot_service.member_to_source_hash``.
 
+For a GHOST member the contract has a second leg: apply_lot_batch must anchor
+the hash on the claim group's CANONICAL parent (via movement_split), exactly
+like split_service anchored the ghost entry — or member and entry drift apart
+whenever a later run re-emits a group off a different parent.
+
 DB-free: imports never touch app.main (which connects to Postgres at import).
 """
 from datetime import datetime, timezone
 from decimal import Decimal
+from types import SimpleNamespace
 
 from app.api.v1.endpoints.tasks import FinacleEntryIn, _to_parsed
+from app.repositories.movement_lot_repository import movement_lot_repository
+from app.repositories.movement_split_repository import movement_split_repository
 from app.services.lot_service import lot_service
 
 FLOW_ID = 42
@@ -95,36 +103,105 @@ def test_hash_sensitive_to_identity_fields():
 
 def test_ghost_hash_follows_the_same_formula_with_its_own_external_ref():
     """A ghost is a normal finacle movement as far as hashing goes: only its
-    external_ref differs from its parent's (same account, same day — it IS the
-    same movement, sliced). Nothing special is needed for it to be addressable."""
-    parent = _member_hash(external_ref="S123456789")
-    ghost = _member_hash(external_ref="S123456789~c386eba7f1")
-    assert ghost != parent
+    external_ref differs (KEY:<claim>~<tags>, the group's identity). Nothing
+    special is needed for it to be addressable."""
+    real = _member_hash(external_ref="S123456789")
+    ghost = _member_hash(external_ref="KEY:PTEL-X~c386eba7~f1a2b3c4d5")
+    assert ghost != real
     # Stable, and distinct per bucket suffix.
-    assert ghost == _member_hash(external_ref="S123456789~c386eba7f1")
-    assert ghost != _member_hash(external_ref="S123456789~1f21d8baa1")
+    assert ghost == _member_hash(external_ref="KEY:PTEL-X~c386eba7~f1a2b3c4d5")
+    assert ghost != _member_hash(external_ref="KEY:PTEL-X~c386eba7~0000000000")
 
 
-def test_a_ghosts_parent_hash_is_reachable_from_the_ghosts_own_fields():
-    """The wire never carries a hash: split_service hashes the parent from its
-    identity, and lot_service re-derives the SAME value for the ghost's member
-    row using the parent's external_ref plus the ghost's account and dates. If
-    these two ever drift, every ghost points at a parent that does not exist."""
-    account = "0010130015001"
-    value_date = datetime(2026, 7, 1, 9, 30, 0)
-    operation_date = datetime(2026, 7, 1, 10, 45, 0)
+class _FakeSession:
+    def commit(self):
+        pass
 
-    # What split_service stores as movement_split.source_hash…
-    parent_hash = lot_service.member_to_source_hash(
-        flow_id=FLOW_ID, external_ref="S123456789",
-        account=account, value_date=value_date, operation_date=operation_date,
+    def rollback(self):
+        pass
+
+
+def test_ghost_member_hash_anchors_on_the_groups_canonical(monkeypatch):
+    """The wire never carries a hash: split_service hashed the ghost entry on
+    the CANONICAL parent's account/dates, so apply_lot_batch must derive the
+    member's hash from the same anchor — not from the wire fields — or the
+    member and its entry stop joining on source_hash."""
+    canonical = SimpleNamespace(
+        claim_key_type="MSGID", claim_key_value="PTEL-X",
+        source_hash="f" * 64, external_ref="S0-CANONICAL",
+        account="0010130015001",
+        value_date=datetime(2026, 6, 15, tzinfo=timezone.utc),
+        operation_date=datetime(2026, 6, 15, tzinfo=timezone.utc),
     )
-    # …and what apply_lot_batch derives for the ghost member pointing at it.
-    derived = lot_service.member_to_source_hash(
-        flow_id=FLOW_ID, external_ref="S123456789",   # split_parent_external_ref
-        account=account, value_date=value_date, operation_date=operation_date,
+    upserted = {}
+
+    monkeypatch.setattr(
+        movement_split_repository, "resolve_group_canonicals",
+        lambda db, *, flow_source_id, claims: {("MSGID", "PTEL-X"): canonical},
     )
-    assert derived == parent_hash
+    monkeypatch.setattr(
+        movement_lot_repository, "create_lots",
+        lambda db, *, flow_id, flow_source_id, buckets: len(buckets),
+    )
+    monkeypatch.setattr(
+        movement_lot_repository, "lot_currencies",
+        lambda db, *, lot_ids: {lid: "EUR" for lid in lot_ids},
+    )
+
+    def _upsert_members(db, rows):
+        upserted["rows"] = list(rows)
+        return len(rows), 0, {r["source_hash"]: i for i, r in enumerate(rows)}
+
+    monkeypatch.setattr(movement_lot_repository, "upsert_members", _upsert_members)
+    monkeypatch.setattr(movement_lot_repository, "insert_keys", lambda db, rows: len(rows))
+    monkeypatch.setattr(
+        movement_lot_repository, "sync_lot_currencies", lambda db, *, lot_ids: None
+    )
+    monkeypatch.setattr(
+        movement_lot_repository, "sync_synthetic_only", lambda db, *, lot_ids: None
+    )
+
+    ghost_member = SimpleNamespace(
+        lot_id="11111111-1111-4111-8111-111111111111",
+        movement_type="NDGB",
+        external_ref="KEY:PTEL-X~c386eba7~f1a2b3c4d5",
+        account="0010130015001",
+        currency="EUR",
+        amount=Decimal("-700.00"),
+        direction="debit",
+        # Wire dates = the RUN's canonical, deliberately different from stored.
+        value_date=datetime(2026, 7, 1, tzinfo=timezone.utc),
+        operation_date=datetime(2026, 7, 1, tzinfo=timezone.utc),
+        transaction_particulars=None,
+        ref_no=None,
+        remarks_1="PTEL-X",
+        claim_key_type="msgid",   # folded by the service
+        claim_key_value="ptel-x",
+        payment_count=2,
+        keys=[],
+    )
+    lot_service.apply_lot_batch(
+        _FakeSession(),
+        flow=SimpleNamespace(id=FLOW_ID),
+        source=SimpleNamespace(id=7),
+        lots=[],
+        members=[ghost_member],
+    )
+
+    row = upserted["rows"][0]
+    assert row["split_parent_hash"] == canonical.source_hash
+    assert row["value_date"] == canonical.value_date
+    assert row["source_hash"] == lot_service.member_to_source_hash(
+        flow_id=FLOW_ID, external_ref=ghost_member.external_ref,
+        account=canonical.account, value_date=canonical.value_date,
+        operation_date=canonical.operation_date,
+    )
+    # NOT what the wire fields alone would have produced.
+    assert row["source_hash"] != lot_service.member_to_source_hash(
+        flow_id=FLOW_ID, external_ref=ghost_member.external_ref,
+        account=ghost_member.account, value_date=ghost_member.value_date,
+        operation_date=ghost_member.operation_date,
+    )
 
 
 def test_derive_lot_status_truth_table():

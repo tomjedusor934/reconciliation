@@ -2,9 +2,16 @@ from typing import List, Optional
 
 from sqlalchemy.orm import Session
 
-from app.models.flow import Flow, FlowSource, FlowSourceAccount
+from app.models.flow import Flow, FlowSource, FlowSourceAccount, ParserType
 from app.repositories.flow_repository import flow_repository, flow_source_repository
 from app.schemas.flow import FlowCreate, FlowUpdate
+
+
+# finacle_db parsers whose perimeter is NOT a set of reference accounts, so the
+# "at least one account" rule must not apply to them. WERO filters std.Payment
+# on InitModule and reads the WERO table wholesale — it has no GL account, and
+# requiring one would make the flow uneditable from the UI.
+_ACCOUNTLESS_PARSERS = {ParserType.WERO.value}
 
 
 class FlowService:
@@ -13,7 +20,9 @@ class FlowService:
         for src in sources:
             src_data = src if isinstance(src, dict) else src.model_dump()
             stype = src_data.get("source_type", "file")
-            if stype == "finacle_db":
+            ptype = src_data.get("parser_type")
+            ptype = getattr(ptype, "value", ptype)
+            if stype == "finacle_db" and ptype not in _ACCOUNTLESS_PARSERS:
                 if not src_data.get("accounts"):
                     raise ValueError(
                         f"Source '{src_data.get('code', '?')}': at least one reference account is required for finacle_db sources"

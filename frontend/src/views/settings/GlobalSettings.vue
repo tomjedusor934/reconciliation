@@ -1,15 +1,17 @@
 <script setup lang="ts">
 import { ref } from 'vue';
-import { useRoute } from 'vue-router';
+import { useRoute, useRouter } from 'vue-router';
 import ApplicationSettingsView from './ApplicationSettingsView.vue';
 import PasswordSettingsView from './PasswordSettingsView.vue';
 import ConnectionsSettingsView from './ConnectionsSettingsView.vue';
 import SsoSettingsView from './SsoSettingsView.vue';
 import MaintenanceSettingsView from './MaintenanceSettingsView.vue';
+import RcpReattributionView from './RcpReattributionView.vue';
 
-type TabId = 'application' | 'password' | 'connections' | 'sso' | 'maintenance';
+type TabId = 'application' | 'password' | 'connections' | 'sso' | 'maintenance' | 'rcp';
 
 const route = useRoute();
+const router = useRouter();
 const activeTab = ref<TabId>(
   (route.query.tab as TabId) || 'application'
 );
@@ -19,11 +21,17 @@ const tabs = [
   { id: 'password', label: 'Security', name: 'Security Settings' },
   { id: 'connections', label: 'Connections', name: 'Data Connections' },
   { id: 'sso', label: 'Single Sign-On', name: 'SSO Settings' },
-  { id: 'maintenance', label: 'Maintenance', name: 'Maintenance' }
+  { id: 'maintenance', label: 'Maintenance', name: 'Maintenance' },
+  // Temporary operator tool — see views/settings/RcpReattributionView.vue.
+  { id: 'rcp', label: 'Réattribution RCP', name: 'RCP reattribution' }
 ];
 
 const switchTab = (tabId: TabId) => {
   activeTab.value = tabId;
+  // Keep the tab in the URL: a reload (or coming back to the tab) used to drop
+  // the operator back on "Application", which looked like the running job had
+  // been cancelled.
+  router.replace({ query: { ...route.query, tab: tabId } });
 };
 </script>
 
@@ -61,6 +69,7 @@ const switchTab = (tabId: TabId) => {
       <ConnectionsSettingsView v-if="activeTab === 'connections'" />
       <SsoSettingsView v-if="activeTab === 'sso'" />
       <MaintenanceSettingsView v-if="activeTab === 'maintenance'" />
+      <RcpReattributionView v-if="activeTab === 'rcp'" />
     </div>
   </div>
 </template>

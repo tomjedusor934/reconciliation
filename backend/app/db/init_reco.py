@@ -10,6 +10,7 @@ Creates:
 Idempotent: safe to call on every backend start.
 """
 import logging
+import re
 
 from sqlalchemy import text
 from sqlalchemy.orm import Session
@@ -17,6 +18,16 @@ from sqlalchemy.orm import Session
 from app.models.payment_status import EntryPaymentStatus
 
 logger = logging.getLogger(__name__)
+
+# Native PG enum labels added to ``parser_type`` after the type was first
+# created. Labels are the Python enum NAMES (uppercase), not their values —
+# SQLAlchemy stores names. A label can never be dropped from a PG enum, so this
+# list only ever grows; every entry is a no-op once applied (see step 4).
+_PARSER_TYPE_LABELS = (
+    "FINACLE_BATCH_BOOKING_TRUE",
+    "WERO",
+)
+_ENUM_LABEL_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 
 # Tables (under schema ``reco``) that should be audited via triggers.
 # ``reconciliation_entry`` is excluded (very high volume — audit on inserts
@@ -63,6 +74,15 @@ _ADDED_COLUMNS = [
     # replaced the residual ghost.
     ("reco.movement_split", "payment_amount", "NUMERIC(20, 4) NOT NULL DEFAULT 0"),
     ("reco.movement_split", "shared_key_movements", "INTEGER NOT NULL DEFAULT 1"),
+    # The claim group a split parent belongs to (see MovementSplit): ghosts are
+    # emitted once per (flow_source_id, claim_key_type, claim_key_value) and the
+    # second reconciliation compares Σ(parents) to Σ(ghosts) per group.
+    ("reco.movement_split", "claim_key_type", "VARCHAR(16) NOT NULL DEFAULT ''"),
+    ("reco.movement_split", "claim_key_value", "VARCHAR(128) NOT NULL DEFAULT ''"),
+    # Set by the second reconciliation: this lot carries a ghost of a claim
+    # group whose parents do not add up to its ghosts — even matched, the lot
+    # is not fully validated (see MovementLot).
+    ("reco.movement_lot", "parent_mismatch", "BOOLEAN NOT NULL DEFAULT false"),
 ]
 
 # Indexes on pre-existing tables — ``create_all`` only builds the ones declared
@@ -91,6 +111,11 @@ _ADDED_INDEXES = [
         "CREATE INDEX IF NOT EXISTS ix_movement_lot_member_split_parent "
         "ON reco.movement_lot_member (split_parent_hash)",
     ),
+    (
+        "ix_movement_split_claim",
+        "CREATE INDEX IF NOT EXISTS ix_movement_split_claim "
+        "ON reco.movement_split (flow_source_id, claim_key_type, claim_key_value)",
+    ),
 ]
 
 # Columns removed from already-existing tables — same reasoning as _ADDED_COLUMNS
@@ -103,6 +128,11 @@ _DROPPED_COLUMNS = [
     # Superseded by payment_amount: the gap between std.Payment and the
     # accounting is now data on the movement, not a residual ghost in a bucket.
     ("reco.movement_split", "residual_amount"),
+    # Superseded by claim groups: ghosts are always priced at their bucket's
+    # exact payment sums, once per group — the prorata regime this flag used to
+    # record is gone, and the group delta is what the second reconciliation
+    # surfaces instead.
+    ("reco.movement_split", "payment_trusted"),
 ]
 
 
@@ -236,33 +266,38 @@ def init_reco_db(db: Session) -> None:
 
     db.commit()
 
-    # 4. Enum evolution — parser_type gained FINACLE_BATCH_BOOKING_TRUE.
+    # 4. Enum evolution — parser_type gained FINACLE_BATCH_BOOKING_TRUE, then WERO.
     # DBs provisioned by create_all carry a native PG enum (labels = Python enum
     # NAMES) that predates the value; add it idempotently, resolving the type's
     # actual schema (SQLAlchemy creates it unqualified → usually public).
     # Alembic-001 DBs store this column as varchar and have no such type → no-op.
     # PG12+ allows ADD VALUE inside a transaction as long as the label is only
     # USED in later transactions (the seed parser flip runs after this commit).
-    db.execute(
-        text(
-            """
-            DO $$
-            DECLARE v_schema text;
-            BEGIN
-                SELECT n.nspname INTO v_schema
-                FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace
-                WHERE t.typname = 'parser_type' AND t.typtype = 'e'
-                LIMIT 1;
-                IF v_schema IS NOT NULL THEN
-                    EXECUTE format(
-                        'ALTER TYPE %I.parser_type ADD VALUE IF NOT EXISTS %L',
-                        v_schema, 'FINACLE_BATCH_BOOKING_TRUE'
-                    );
-                END IF;
-            END $$;
-            """
+    # The label is inlined, never bound: the DO body carries format()'s %I / %L,
+    # and psycopg2 only starts interpreting '%' once a statement has parameters.
+    for label in _PARSER_TYPE_LABELS:
+        if not _ENUM_LABEL_RE.match(label):  # our own constants — belt and braces
+            raise ValueError(f"invalid parser_type enum label: {label!r}")
+        db.execute(
+            text(
+                f"""
+                DO $$
+                DECLARE v_schema text;
+                BEGIN
+                    SELECT n.nspname INTO v_schema
+                    FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace
+                    WHERE t.typname = 'parser_type' AND t.typtype = 'e'
+                    LIMIT 1;
+                    IF v_schema IS NOT NULL THEN
+                        EXECUTE format(
+                            'ALTER TYPE %I.parser_type ADD VALUE IF NOT EXISTS %L',
+                            v_schema, '{label}'
+                        );
+                    END IF;
+                END $$;
+                """
+            )
         )
-    )
     db.commit()
 
     # 5. Table evolution create_all cannot do — runs BEFORE the column loop so a

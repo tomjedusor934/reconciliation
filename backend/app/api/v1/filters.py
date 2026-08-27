@@ -53,6 +53,14 @@ class ExportFilter:
 class EntryListFilter:
     def __init__(
         self,
+        ids: Optional[List[int]] = Query(
+            default=None,
+            description="Restrict to these entry ids — how a client re-reads rows "
+                        "it already holds (a match basket). Leave `status` unset to "
+                        "search the live AND the émargement table, so a row that has "
+                        "since been reconciled comes back with its new status "
+                        "instead of looking as if it had vanished.",
+        ),
         flow_id: Optional[int] = Query(default=None, description="Filter by flow"),
         status: Optional[EntryStatus] = Query(default=None, alias="status", description="Filter by status"),
         reco_id: Optional[str] = Query(default=None, description="Filter by reco ID"),
@@ -78,6 +86,7 @@ class EntryListFilter:
         date_to: Optional[date] = Query(default=None, description="End date (YYYY-MM-DD)"),
         search: Optional[str] = Query(default=None, description="Free-text search"),
     ):
+        self.ids = ids
         self.flow_id = flow_id
         self.status = status
         self.reco_id = reco_id
@@ -173,8 +182,8 @@ class LotListFilter:
         search: Optional[str] = Query(default=None, description="Lot uuid or key value (substring)"),
         bucket_kind: Optional[str] = Query(
             default=None,
-            pattern="^(PAIR|PACS_ONLY|MSGID_ONLY|PO|RESIDUAL|LEGACY)$",
-            description="What the bucket stands for (RESIDUAL = a split's leftover)",
+            pattern="^(PAIR|PACS_ONLY|MSGID_ONLY|PO|LEGACY)$",
+            description="What the bucket stands for",
         ),
         synthetic_only: Optional[bool] = Query(
             default=None,
@@ -183,6 +192,11 @@ class LotListFilter:
         payment_gap: Optional[bool] = Query(
             default=None,
             description="Buckets holding a split whose booked amount disagrees with std.Payment",
+        ),
+        parent_mismatch: Optional[bool] = Query(
+            default=None,
+            description="Buckets carrying a ghost of a claim group whose parents "
+                        "do not add up to its ghosts (second reconciliation)",
         ),
     ):
         self.flow_id = flow_id
@@ -194,3 +208,4 @@ class LotListFilter:
         self.bucket_kind = bucket_kind
         self.synthetic_only = synthetic_only
         self.payment_gap = payment_gap
+        self.parent_mismatch = parent_mismatch

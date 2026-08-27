@@ -36,6 +36,7 @@ const filters = ref({
   bucket_kind: '',
   synthetic_only: '',
   payment_gap: '',
+  parent_mismatch: '',
 });
 
 const statusOptions = [
@@ -51,7 +52,6 @@ const bucketKindOptions = [
   { value: 'PACS_ONLY', label: 'PACS008 only' },
   { value: 'MSGID_ONLY', label: 'MSGID only' },
   { value: 'PO', label: 'Single payment' },
-  { value: 'RESIDUAL', label: 'Residual (legacy runs)' },
   { value: 'LEGACY', label: 'Legacy cluster' },
 ];
 
@@ -67,6 +67,14 @@ const paymentGapOptions = [
   { value: '', label: 'All' },
   { value: 'true', label: 'With a payment gap' },
   { value: 'false', label: 'Without' },
+];
+
+// The second reconciliation's verdict: the lot carries a slice of a claim
+// group whose movements do not add up to their slices.
+const parentMismatchOptions = [
+  { value: '', label: 'All' },
+  { value: 'true', label: 'Parent mismatch' },
+  { value: 'false', label: 'Parents add up' },
 ];
 
 const balancedOptions = [
@@ -118,6 +126,9 @@ const buildParams = (skip: number): LotFilters => {
   }
   if (filters.value.payment_gap) {
     params.payment_gap = filters.value.payment_gap === 'true';
+  }
+  if (filters.value.parent_mismatch) {
+    params.parent_mismatch = filters.value.parent_mismatch === 'true';
   }
   return params;
 };
@@ -189,6 +200,7 @@ onMounted(async () => {
       <Select v-model="filters.bucket_kind" label="Bucket" :options="bucketKindOptions" />
       <Select v-model="filters.synthetic_only" label="Content" :options="syntheticOptions" />
       <Select v-model="filters.payment_gap" label="Payment data" :options="paymentGapOptions" />
+      <Select v-model="filters.parent_mismatch" label="Parent check" :options="parentMismatchOptions" />
       <Input v-model="filters.date_from" type="date" label="From" />
       <Input v-model="filters.date_to" type="date" label="To" />
       <Input v-model="filters.search" label="Lot uuid / key value" @keyup.enter="fetchLots" />
@@ -218,18 +230,18 @@ onMounted(async () => {
           <span class="font-mono text-xs" :title="item.lot_id">
             {{ bucketLabel(item) }}
           </span>
-          <span
-            v-if="item.bucket_kind === 'RESIDUAL'"
-            class="rounded-full bg-red-100 px-1.5 py-0.5 text-[10px] font-semibold text-red-700"
-            title="Holds what a split could not explain — charges, FX, or a payment missing from the datamart"
-          >
-            residual
-          </span>
           <Layers
-            v-else-if="item.synthetic_only"
+            v-if="item.synthetic_only"
             class="h-3.5 w-3.5 text-indigo-400"
             title="Every movement here is a slice of a batch: the bucket balances by construction"
           />
+          <span
+            v-if="item.parent_mismatch"
+            class="rounded-full bg-orange-100 px-1.5 py-0.5 text-[10px] font-semibold text-orange-700"
+            title="A slice here belongs to a claim group whose movements do not add up to their slices — even matched, this lot is not fully validated"
+          >
+            parent&nbsp;mismatch
+          </span>
           <AlertTriangle
             v-if="item.merge_conflict"
             class="h-3.5 w-3.5 text-amber-500"

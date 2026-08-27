@@ -30,6 +30,7 @@ EXPECTED_DAGS = [
     "ingest_webripost",
     "ingest_other_payments",
     "ingest_finacle_bb",
+    "ingest_wero",
     "reconcile_daily",
     "emargement_sweep",
 ]

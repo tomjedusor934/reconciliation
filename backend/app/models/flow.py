@@ -32,6 +32,11 @@ class ParserType(str, enum.Enum):
     FINACLE_DB = "finacle_db"
     FINACLE_BATCH_BOOKING_TRUE = "finacle_batch_booking_true"
     EXCEL = "excel"
+    # Datamart payment reconciliation: the WERO table joined to std.Payment /
+    # std.[Return] on the end-to-end reference. Not a std.Movement extraction —
+    # no reference account, and parser_config drives every datamart identifier
+    # (see shared/dags/reco_wero.py).
+    WERO = "wero"
 
 
 class MatchKeyStrategy(str, enum.Enum):

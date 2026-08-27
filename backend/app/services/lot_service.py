@@ -18,6 +18,7 @@ from sqlalchemy.orm import Session
 from app.models.flow import Flow, FlowSource
 from app.models.movement_lot import BUCKET_KINDS, KEY_TYPES, LOT_STATUS_MERGED
 from app.repositories.movement_lot_repository import movement_lot_repository
+from app.repositories.movement_split_repository import movement_split_repository
 from app.services.parsers.base_parser import ParsedEntry
 
 logger = logging.getLogger(__name__)
@@ -107,36 +108,60 @@ class LotService:
                 buckets=[lot.model_dump() for lot in lots],
             )
 
+            # Ghost members carry their claim key; their hash — and their
+            # split_parent_hash — must be anchored on the claim group's
+            # CANONICAL parent, exactly as split_service anchored the ghost
+            # entry. The split batch runs first, so movement_split already
+            # knows every group this batch mentions. One query per batch.
+            claims = sorted(
+                {
+                    (m.claim_key_type.strip().upper(), m.claim_key_value.strip().upper())
+                    for m in members
+                    if m.claim_key_type and m.claim_key_value
+                }
+            )
+            canonicals = movement_split_repository.resolve_group_canonicals(
+                db, flow_source_id=source.id, claims=claims
+            )
+
             member_rows: Dict[str, dict] = {}
             key_specs: Dict[str, List[Tuple[str, str]]] = {}
             for member in members:
                 for key in member.keys:
                     if key.key_type not in KEY_TYPES:
                         raise ValueError(f"unknown key_type {key.key_type!r}")
-                value_date = _to_utc(member.value_date)
-                operation_date = _to_utc(member.operation_date) or value_date
+                account = member.account
+                value_date = member.value_date
+                operation_date = member.operation_date
+                split_parent_hash = None
+                if member.claim_key_type and member.claim_key_value:
+                    claim = (
+                        member.claim_key_type.strip().upper(),
+                        member.claim_key_value.strip().upper(),
+                    )
+                    canon = canonicals.get(claim)
+                    if canon is not None:
+                        account = canon.account
+                        value_date = canon.value_date
+                        operation_date = canon.operation_date
+                        split_parent_hash = canon.source_hash
+                    else:
+                        # Split batch missing (lost push?): fall back to the
+                        # wire fields so the member still lands, unlinked.
+                        logger.warning(
+                            "[lot] ghost member %s: claim group %s:%s unknown to "
+                            "movement_split — hashed on wire fields, no parent link",
+                            member.external_ref, claim[0], claim[1],
+                        )
                 source_hash = self.member_to_source_hash(
                     flow_id=flow.id,
                     external_ref=member.external_ref,
-                    account=member.account,
-                    value_date=member.value_date,
-                    operation_date=member.operation_date,
+                    account=account,
+                    value_date=value_date,
+                    operation_date=operation_date,
                 )
-                # A ghost shares its parent's account and dates — same movement,
-                # sliced — so the parent's hash comes out of the same formula
-                # with the parent's external_ref. Matches what split_service
-                # computed when it registered the parent.
-                split_parent_hash = (
-                    self.member_to_source_hash(
-                        flow_id=flow.id,
-                        external_ref=member.split_parent_external_ref,
-                        account=member.account,
-                        value_date=member.value_date,
-                        operation_date=member.operation_date,
-                    )
-                    if member.split_parent_external_ref
-                    else None
-                )
+                utc_value = _to_utc(value_date)
+                utc_operation = _to_utc(operation_date) or utc_value
                 # Overlap re-streams can repeat a movement within one batch —
                 # later occurrence wins, mirroring the entry upsert.
                 member_rows[source_hash] = {
@@ -144,12 +169,12 @@ class LotService:
                     "source_hash": source_hash,
                     "movement_type": member.movement_type,
                     "external_ref": member.external_ref,
-                    "account": member.account,
+                    "account": account,
                     "currency": member.currency,
                     "amount": member.amount,
                     "direction": member.direction,
-                    "value_date": value_date,
-                    "operation_date": operation_date,
+                    "value_date": utc_value,
+                    "operation_date": utc_operation,
                     "transaction_particulars": member.transaction_particulars,
                     "ref_no": member.ref_no,
                     "remarks_1": member.remarks_1,
@@ -249,6 +274,7 @@ class LotService:
             "bucket_po": row.bucket_po or None,
             "bucket_ref": row.bucket_ref or None,
             "synthetic_only": bool(row.synthetic_only),
+            "parent_mismatch": bool(row.parent_mismatch),
             "created_at": row.created_at,
             "updated_at": row.updated_at,
         }
@@ -266,6 +292,7 @@ class LotService:
         bucket_kind: Optional[str] = None,
         synthetic_only: Optional[bool] = None,
         payment_gap: Optional[bool] = None,
+        parent_mismatch: Optional[bool] = None,
         skip: int = 0,
         limit: int = 50,
     ) -> Tuple[List[Dict[str, Any]], int]:
@@ -274,7 +301,7 @@ class LotService:
             flow_id=flow_id, status=status, balanced=balanced,
             date_from=date_from, date_to=date_to, search=search,
             bucket_kind=bucket_kind, synthetic_only=synthetic_only,
-            payment_gap=payment_gap,
+            payment_gap=payment_gap, parent_mismatch=parent_mismatch,
             skip=skip, limit=limit,
         )
         return [self._row_to_summary(r) for r in rows], total

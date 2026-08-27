@@ -53,8 +53,15 @@ class FinacleSourceInfo(BaseModel):
     source_id: int
     source_code: str
     # Routes the source to the right extractor: "finacle_db" (legacy 1-key
-    # classification) or "finacle_batch_booking_true" (lot clustering DAG).
+    # classification), "finacle_batch_booking_true" (lot clustering DAG) or
+    # "wero" (payment reconciliation DAG). Each extractor self-selects on this
+    # value, so a source is never picked up by two of them.
     parser_type: Optional[str] = None
+    # Per-source extractor settings (FlowSource.parser_config). Unused by the
+    # finacle extractors; the WERO one takes every datamart identifier from it
+    # so an unconfirmed table/column can be retuned from the UI without a DAG
+    # redeploy.
+    parser_config: Dict[str, Any] = Field(default_factory=dict)
     accounts: List[str]
     last_success_at: Optional[datetime] = None
     # Lower bound (ISO date) for a source's first extraction (no watermark yet).
@@ -234,6 +241,7 @@ def list_finacle_sources(
                     source_id=source.id,
                     source_code=source.code,
                     parser_type=source.parser_type.value if source.parser_type else None,
+                    parser_config=source.parser_config or {},
                     accounts=[a.account_number for a in source.accounts],
                     last_success_at=ingestion_run_repository.last_success_for_source(
                         db, flow_source_id=source.id

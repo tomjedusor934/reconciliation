@@ -21,7 +21,6 @@ sys.path.insert(0, str(DAGS_DIR))
 
 from reco_datamart_bb import (  # noqa: E402
     BUCKET_PAIR,
-    BUCKET_RESIDUAL,
     BucketKey,
     bucket_debug_report,
     parse_trace_keys,
@@ -30,8 +29,8 @@ from reco_datamart_bb import (  # noqa: E402
 
 
 def member(lot_id, movement_type, amount, keys, value_date="2026-07-01T00:00:00",
-           split_parent=None):
-    """Member dict in the exact _build_member shape."""
+           claim=None):
+    """Member dict in the exact _build_member shape (claim set ⇒ ghost)."""
     return {
         "lot_id": lot_id,
         "movement_type": movement_type,
@@ -45,9 +44,26 @@ def member(lot_id, movement_type, amount, keys, value_date="2026-07-01T00:00:00"
         "transaction_particulars": f"{movement_type}/I/x",
         "ref_no": None,
         "remarks_1": None,
-        "split_parent_external_ref": split_parent,
+        "claim_key_type": claim[0] if claim else None,
+        "claim_key_value": claim[1] if claim else None,
         "payment_count": None,
         "keys": [{"key_type": kt, "key_value": kv} for kt, kv in keys],
+    }
+
+
+def group(name, parents_amounts, children_amounts):
+    """Claim-group payload in the exact plan_claim_group shape (the fields the
+    report reads)."""
+    return {
+        "claim_key_type": "MSGID",
+        "claim_key_value": name,
+        "parents": [
+            {"external_ref": f"{name}-p{i}", "amount": a,
+             "payment_amount": pa}
+            for i, (a, pa) in enumerate(parents_amounts)
+        ],
+        "children": [{"external_ref": f"KEY:{name}~{i}", "amount": a}
+                     for i, a in enumerate(children_amounts)],
     }
 
 
@@ -76,6 +92,8 @@ def test_biggest_bucket_selected_with_type_and_amount_breakdown():
     assert report["members_total"] == 6
     assert report["top_lots"][0] == {"lot_id": "big", "members": 5}
     assert report["bucket_kinds"] == {BUCKET_PAIR: 1}
+    assert report["single_member_buckets"] == 1  # "small"
+    assert report["single_member_ghost_buckets"] == 0
 
     big = report["biggest_lot"]
     assert big["lot_id"] == "big"
@@ -87,12 +105,27 @@ def test_biggest_bucket_selected_with_type_and_amount_breakdown():
     assert big["distinct_keys_by_type"] == {"MSGID": 4, "PACS008": 1}
 
 
+def test_single_ghost_buckets_are_counted_apart():
+    """The over-fetch signature: thousands of buckets fed exactly one GHOST —
+    payments claimed by a key whose counterpart can never arrive."""
+    members = [
+        member("g1", "NDGB", "10.00", [], claim=("MSGID", "LUXEMBOURG")),
+        member("g2", "NDGB", "20.00", [], claim=("MSGID", "LUXEMBOURG")),
+        member("r1", "SCTXB", "-5.00", []),
+        member("pair", "NDGB", "1.00", [], claim=("MSGID", "LUXEMBOURG")),
+        member("pair", "SCTXB", "-1.00", []),
+    ]
+    report = bucket_debug_report(members, {}, [])
+    assert report["single_member_buckets"] == 3       # g1, g2, r1
+    assert report["single_member_ghost_buckets"] == 2  # g1, g2
+
+
 def test_report_counts_ghosts_and_flags_a_fully_synthetic_bucket():
     """The number to watch after a deploy: a bucket where both sides are ghosts
     nets to zero by construction and proves nothing on its own."""
     members = [
-        member("ghosty", "SCTXB", "-10.00", [("PACS008", "P1")], split_parent="A"),
-        member("ghosty", "NDGB", "10.00", [("PACS008", "P1")], split_parent="B"),
+        member("ghosty", "SCTXB", "-10.00", [("PACS008", "P1")], claim=("PACS008", "P1")),
+        member("ghosty", "NDGB", "10.00", [("PACS008", "P1")], claim=("MSGID", "M1")),
     ]
     report = bucket_debug_report(members, buckets_for(("ghosty", "P1", "M1")), [])
     assert report["ghost_members_total"] == 2
@@ -105,32 +138,34 @@ def test_report_counts_ghosts_and_flags_a_fully_synthetic_bucket():
 
 
 def test_report_counts_the_parents_std_payment_disagrees_with():
-    parents = [
-        {"external_ref": "A", "amount": "-1000.00", "payment_amount": "-1000.00"},
-        {"external_ref": "B", "amount": "-1000.00", "payment_amount": "-990.00"},
-    ]
-    report = bucket_debug_report([], {}, parents)
+    groups = [group("K1", [("-1000.00", "-1000.00"), ("-1000.00", "-990.00")],
+                    ["-2000.00"])]
+    report = bucket_debug_report([], {}, groups)
     assert report["split_parents"] == 2
+    assert report["claim_groups"] == 1
     assert report["parents_with_payment_gap"] == 1
 
 
-def test_report_surfaces_shared_aggregate_keys():
-    """The number that would have exposed the prod case at a glance: 184
-    movements claiming one payment group."""
-    parents = [
-        {"external_ref": "A", "amount": "-1", "payment_amount": "-1"},
-        {"external_ref": "B", "amount": "-1", "payment_amount": "-1",
-         "shared_key_movements": 184},
+def test_report_surfaces_shared_keys_and_group_deltas():
+    """The two numbers that expose the prod cases at a glance: 184 movements
+    claiming one payment group, and a group whose ghosts do not add up to its
+    movements (the second reconciliation will tag its lots)."""
+    groups = [
+        group("PTEL", [("-1", "-1")] * 184, ["-183.50"]),  # delta -0.50
+        group("CLEAN", [("-10", "-10")], ["-10"]),          # delta 0
     ]
-    report = bucket_debug_report([], {}, parents)
-    assert report["parents_sharing_a_key"] == 1
+    report = bucket_debug_report([], {}, groups)
+    assert report["groups_sharing_a_key"] == 1
     assert report["max_shared_key"] == 184
+    assert report["groups_with_delta"] == 1
+    top = report["top_group_deltas"][0]
+    assert top["claim"] == "MSGID:PTEL"
+    assert top["parents"] == 184
+    assert top["delta"] == "-0.50"
 
 
-def test_report_survives_a_run_with_only_parents():
-    report = bucket_debug_report(
-        [], {}, [{"external_ref": "A", "amount": "-1", "payment_amount": "-1"}]
-    )
+def test_report_survives_a_run_with_only_groups():
+    report = bucket_debug_report([], {}, [group("K1", [("-1", "-1")], ["-1"])])
     assert report["biggest_lot"] is None
     json.dumps(report, default=str)  # must not raise
 
@@ -164,14 +199,6 @@ def test_sample_members_keep_pushed_shape_and_truncate_keys():
     # The original buffer must not be mutated by sampling.
     assert len(members[0]["keys"]) == 30
     assert "keys_truncated" not in members[0]
-
-
-def test_residual_buckets_show_up_in_the_kind_breakdown():
-    members = [member("res", "SCTXB", "-10.00", [], split_parent="A")]
-    buckets = {"res": BucketKey(BUCKET_RESIDUAL, ref="deadbeef")}
-    report = bucket_debug_report(members, buckets, [])
-    assert report["bucket_kinds"] == {BUCKET_RESIDUAL: 1}
-    assert report["biggest_lot"]["bucket"] == "RESIDUAL:deadbeef"
 
 
 def test_parse_trace_keys_tolerates_spaces_and_colons_in_values():

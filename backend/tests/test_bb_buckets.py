@@ -42,9 +42,11 @@ from reco_datamart_bb import (  # noqa: E402
     classify_bb_movement,
     collect_lookup_inputs,
     movement_resolution,
+    looks_like_pacs008,
     ndrj_po_id,
     partition_payments,
     payment_bucket,
+    sp_direct_pacs008,
     sp_return_po_id,
 )
 
@@ -130,6 +132,67 @@ def test_a_label_msgid_no_longer_glues_unrelated_pacs008():
     a = bucket_id(1, BucketKey(BUCKET_PAIR, pacs="PACS1", msgid="LUXEMBOURG"))
     b = bucket_id(1, BucketKey(BUCKET_PAIR, pacs="PACS2", msgid="LUXEMBOURG"))
     assert a != b
+
+
+# ---------------------------------------------------------------------------
+# case folding — the datamart compares case-insensitively, so must we
+# ---------------------------------------------------------------------------
+
+def test_bucket_identity_ignores_case():
+    """THE regression. An NDGB reads its MessageID off the movement's Remarks_1,
+    which Finacle writes in upper case; an SP bulk reads it off std.Payment,
+    which keeps the real casing. SQL Server's collation matches them, Python did
+    not — so '2412-20260731-RUMELANGE' and '2412-20260731-Rumelange' became two
+    buckets holding +1 573,80 and -1 573,80 that could never meet."""
+    ndgb = BucketKey(BUCKET_PAIR, pacs="26080309550401355", msgid="2412-20260731-RUMELANGE")
+    sctxb = BucketKey(BUCKET_PAIR, pacs="26080309550401355", msgid="2412-20260731-Rumelange")
+    assert bucket_id(16, ndgb) == bucket_id(16, sctxb)
+    assert ndgb == sctxb  # equal as values too, so they group together
+
+
+@pytest.mark.parametrize("field", ["pacs", "msgid", "po", "ref"])
+def test_every_identity_component_is_folded(field):
+    lower = BucketKey(BUCKET_PAIR, **{field: "abc-Def"})
+    upper = BucketKey(BUCKET_PAIR, **{field: "ABC-DEF"})
+    assert bucket_id(1, lower) == bucket_id(1, upper)
+    assert getattr(lower, field) == "ABC-DEF"  # stored canonical
+
+
+def test_folding_does_not_merge_genuinely_different_values():
+    assert bucket_id(1, BucketKey(BUCKET_PAIR, pacs="P", msgid="ABC")) != bucket_id(
+        1, BucketKey(BUCKET_PAIR, pacs="P", msgid="ABD")
+    )
+    # Accents stay significant: the collation is CI_AS, and upper() matches that.
+    assert bucket_id(1, BucketKey(BUCKET_PAIR, msgid="CRECHE")) != bucket_id(
+        1, BucketKey(BUCKET_PAIR, msgid="CRÈCHE")
+    )
+
+
+def test_payment_bucket_folds_whatever_it_is_handed():
+    assert payment_bucket("pacs1", "msgA", None) == payment_bucket("PACS1", "MSGA", None)
+    assert payment_bucket(None, None, "po-7") == BucketKey(BUCKET_PO, po="PO-7")
+
+
+def test_two_spellings_collapse_into_one_payment_group():
+    """Not merely the same id: the two sides' payments must land in ONE group so
+    their amounts add up, instead of producing two half-sized slices."""
+    groups = partition_payments([
+        PaymentRef("26080309550401355", "2412-20260731-RUMELANGE", "po1", D("1000")),
+        PaymentRef("26080309550401355", "2412-20260731-Rumelange", "po2", D("573.80")),
+    ])
+    assert len(groups) == 1
+    group = next(iter(groups.values()))
+    assert group.amount == D("1573.80")
+    assert group.count == 2
+
+
+def test_searchable_keys_are_folded_too():
+    """A key must be spelled the way the bucket it navigates to is."""
+    key = BucketKey(BUCKET_PAIR, pacs="pacs1", msgid="msgA")
+    keys = bucket_keys(key, PaymentGroup(D("10"), ["po-a"]))
+    assert (KEY_PACS008, "PACS1") in keys
+    assert (KEY_MSGID, "MSGA") in keys
+    assert (KEY_PO, "PO-A") in keys
 
 
 def test_payment_bucket_kinds():
@@ -281,7 +344,8 @@ def test_bucket_keys_carry_the_identity_and_small_payment_sets():
     key = BucketKey(BUCKET_PAIR, pacs="PACS1", msgid="MSGA")
     keys = bucket_keys(key, PaymentGroup(D("10"), ["po1", "po2"]))
     assert (KEY_PACS008, "PACS1") in keys and (KEY_MSGID, "MSGA") in keys
-    assert (KEY_PO, "po1") in keys and (KEY_PO, "po2") in keys
+    # Folded, like every other key (see test_searchable_keys_are_folded_too).
+    assert (KEY_PO, "PO1") in keys and (KEY_PO, "PO2") in keys
 
 
 def test_bucket_keys_drop_the_po_fan_out_of_a_bulk(monkeypatch):
@@ -314,9 +378,110 @@ def test_collect_lookup_inputs_both_shapes():
     )
     collect_lookup_inputs([app_entry(tp="SCTXB/I/x", remarks_1="PACS2")], acc)
     assert acc.sp_pacs008 == {"PACS1", "PACS2"}
-    assert acc.ndgb_msgids == {"AGG1"}
+    # MessageIDs carry their fan-out window; these rows are dateless.
+    assert acc.ndgb_msgids == {"AGG1": [None, None]}
     assert acc.po_ids == {"POREF", "PO9"}  # NDRJ + SP returns
 
 
 def test_unresolved_sentinel_is_the_backend_one():
     assert UNRESOLVED_RECO_ID == "Not Supported"
+
+
+# ---------------------------------------------------------------------------
+# Return / reject shapes the parser used to miss
+#
+# RRS and RCP were in neither segment set, so they fell through to the SP direct
+# branch, which reads Remarks_1 AS the pacs008 — and on a return Remarks_1 is the
+# counterparty IBAN or a UUID. That minted 5 652 lots keyed on an IBAN or a UUID
+# on the outward float, 90% of its PACS_ONLY lots.
+# ---------------------------------------------------------------------------
+
+def test_rrs_settles_in_the_original_payments_bucket():
+    po_map = {"PO1": [("MSGA", "PACS1", D("50"))]}
+    row = raw_row(
+        tp="SDDXB/RRS/I/PO1", ref_no="PO1",
+        remarks_1="DC77B536-23D1-4F26-AA6A-5DA12A85C1EC",
+    )
+    res = resolve(row, po_map=po_map)
+    assert list(partition_payments(res.payments)) == [
+        BucketKey(BUCKET_PAIR, pacs="PACS1", msgid="MSGA")
+    ]
+    assert res.claim == (KEY_PO, "PO1")
+
+
+def test_rcp_goes_through_the_return_table_like_rcc():
+    return_map = {"RET1": [("PO1", "MSGA", "PACS1", D("30"))]}
+    row = raw_row(
+        tp="SCTXB/RCP/I/RET1/STACKINSAT", ref_no="RET1",
+        remarks_1="FR7619733000010100000206732",
+    )
+    res = resolve(row, return_map=return_map)
+    assert list(partition_payments(res.payments)) == [
+        BucketKey(BUCKET_PAIR, pacs="PACS1", msgid="MSGA")
+    ]
+
+
+def test_return_shape_resolves_whatever_the_prefix_carries():
+    # 'Rev of /NCP/O/<po>/<name>' — Finacle's label for the reversal of a return.
+    po_map = {"PO1": [("MSGA", "PACS1", D("5"))]}
+    row = raw_row(tp="Rev of /NCP/O/PO1/TRESORERIE DE L'ETAT", ref_no="PO1")
+    assert classify_bb_movement(row) == "REV OF"
+    assert list(partition_payments(resolve(row, po_map=po_map).payments)) == [
+        BucketKey(BUCKET_PAIR, pacs="PACS1", msgid="MSGA")
+    ]
+
+
+def test_a_bkrtp_return_stays_an_instant_keyed_on_its_ref_no():
+    # The generic shape is tested LAST on purpose: BKRTP/NCP is an IP keyed by
+    # ref_no. Widening the rule must not re-key the 15 269 of them.
+    res = resolve(raw_row(tp="BKRTP/NCP/O/PO1/x", ref_no="PO1"), po_map={"PO1": [("M", "P", D("1"))]})
+    assert res.payments == () and res.fallback == BucketKey(BUCKET_PO, po="PO1")
+
+
+def test_remarks_1_that_is_not_a_pacs008_never_becomes_a_bucket():
+    assert looks_like_pacs008("26072905552301130")           # 17 digits, real
+    assert looks_like_pacs008("BLK2026188019314")            # aggregate return leg
+    assert not looks_like_pacs008("LU060330233343801710")    # IBAN
+    assert not looks_like_pacs008("DC77B536-23D1-4F26-AA6A-5DA12A85C1EC")  # UUID
+    assert not looks_like_pacs008(None)
+    assert sp_direct_pacs008(raw_row(tp="SCTXB/I/x", remarks_1="LU060330233343801710")) is None
+    # …and the movement stays transient instead of minting a lot on the IBAN
+    res = resolve(raw_row(tp="SCTXB/I/x", remarks_1="LU060330233343801710"))
+    assert res.payments == () and res.fallback is None
+
+
+def test_a_bulk_single_without_remarks_goes_through_its_transaction_ref():
+    # SCTXB/<TransactionRef>/<NAME> and SDDXB/<uuid>/<amount>: the branch the
+    # instant aggregates already had, now reachable from the bulk flow too.
+    msgid_map = {"MSGA": [("PACS1", "po1", D("7"))]}
+    txnref_map = {"SCTXB260727000294311": "MSGA"}
+    res = resolve(
+        raw_row(tp="SCTXB/SCTXB260727000294311/BARTHEL-NESER M-JOSEE"),
+        msgid_map=msgid_map, txnref_map=txnref_map,
+    )
+    assert res.claim == (KEY_MSGID, "MSGA")
+    # RVSL puts that ref one segment further right
+    res = resolve(
+        raw_row(tp="SCTXB/RVSL/SCTXB260727000294311/REQUESTED BY CUSTOMER"),
+        msgid_map=msgid_map, txnref_map=txnref_map,
+    )
+    assert res.claim == (KEY_MSGID, "MSGA")
+
+
+def test_collect_lookup_inputs_feeds_the_new_shapes():
+    acc = BBLookupInputs()
+    collect_lookup_inputs(
+        [
+            raw_row(tp="SDDXB/RRS/I/PO1", ref_no="PO1", remarks_1="A-UUID"),
+            raw_row(tp="SCTXB/RCP/I/RET1/x", ref_no="RET1"),
+            raw_row(tp="Rev of /NCP/O/PO2/x", ref_no="PO2"),
+            raw_row(tp="SCTXB/SCTXB260727000294311/BARTHEL"),
+            raw_row(tp="SCTXB/I/x", remarks_1="LU060330233343801710"),  # IBAN, refused
+        ],
+        acc,
+    )
+    assert acc.po_ids == {"PO1", "PO2"}            # returns → std.Payment
+    assert acc.return_po_ids == {"RET1"}           # rejects → std.[Return]
+    assert "SCTXB260727000294311" in acc.instant_txn_refs
+    assert acc.sp_pacs008 == set()
+    assert sum(acc.rejected_remarks.values()) == 1  # counted, so a new shape is loud

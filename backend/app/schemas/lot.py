@@ -36,8 +36,11 @@ class LotSummary(BaseModel):
     bucket_po: Optional[str] = None
     bucket_ref: Optional[str] = None
     # Every member is a ghost → the lot nets to zero by construction; the real
-    # evidence is the parent conservation in GET /splits/{parent_source_hash}.
+    # evidence is the claim-group reconciliation in GET /splits/{source_hash}.
     synthetic_only: bool = False
+    # The lot carries a ghost of a claim group whose parents do not add up to
+    # its ghosts (second reconciliation) — matched or not, not fully validated.
+    parent_mismatch: bool = False
     created_at: datetime
     updated_at: datetime
 
@@ -174,10 +177,12 @@ class LotMemberIn(BaseModel):
     transaction_particulars: Optional[str] = None
     ref_no: Optional[str] = None
     remarks_1: Optional[str] = None
-    # Ghosts only: the real movement's external_ref. The hash itself is derived
-    # backend-side (the DAG has no way to compute it) from this plus the account
-    # and dates — which a ghost shares with its parent, being the same movement.
-    split_parent_external_ref: Optional[str] = Field(default=None, max_length=128)
+    # Ghosts only: the claim group the ghost belongs to. The backend resolves
+    # the group's canonical parent from ``movement_split`` (the split batch ran
+    # first) and anchors the member's hash — and split_parent_hash — on it,
+    # exactly like the ghost entry was hashed.
+    claim_key_type: Optional[str] = Field(default=None, max_length=16)
+    claim_key_value: Optional[str] = Field(default=None, max_length=128)
     payment_count: Optional[int] = None
     keys: List[LotKeyIn] = Field(default_factory=list)
 

@@ -10,6 +10,7 @@ from app.api.v1.endpoints import (
     ingestion_runs,
     lots,
     match_groups,
+    rcp_reattribution,
     reconciliation_entries,
     reconciliation_runs,
     roles,
@@ -61,4 +62,9 @@ api_router.include_router(tasks_lots.router, tags=["tasks"], prefix="/tasks")
 api_router.include_router(tasks_payment_status.router, tags=["tasks"], prefix="/tasks")
 api_router.include_router(
     source_connections.router, tags=["reconciliation"], prefix="/source-connections"
+)
+# Temporary operator tool — RCP return/reject reattribution (see
+# app/services/rcp_link_service.py).
+api_router.include_router(
+    rcp_reattribution.router, tags=["reconciliation"], prefix="/rcp-reattribution"
 )

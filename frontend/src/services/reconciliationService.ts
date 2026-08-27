@@ -4,6 +4,7 @@ import type { ExclusionCreate, UnexcludeRequest, ReconciliationEntry } from '@/t
 const resource = '/reconciliation-entries';
 
 export interface EntryFilters {
+  ids?: number[];
   flow_id?: number;
   status?: string;
   reco_id?: string;
@@ -29,6 +30,22 @@ export default {
       params,
       paramsSerializer: { indexes: null },
     });
+  },
+  /**
+   * Current server-side state of a known set of entries, by id.
+   *
+   * Sent without `status` on purpose: the endpoint then queries BOTH the live
+   * and the émargement table, so a basket learns the difference between "gone"
+   * and "already reconciled". Chunked because the API caps `limit` at 1000.
+   */
+  async listByIds(ids: number[], chunkSize = 200): Promise<ReconciliationEntry[]> {
+    const out: ReconciliationEntry[] = [];
+    for (let i = 0; i < ids.length; i += chunkSize) {
+      const chunk = ids.slice(i, i + chunkSize);
+      const { data } = await this.list({ ids: chunk, limit: chunk.length });
+      out.push(...data.items);
+    }
+    return out;
   },
   paymentStatusOptions() {
     return api.get<string[]>(`${resource}/payment-status-options`);

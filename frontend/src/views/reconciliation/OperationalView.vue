@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ref, onMounted, computed } from 'vue';
 import { useRoute } from 'vue-router';
-import { Download } from 'lucide-vue-next';
+import { Download, ShoppingBasket } from 'lucide-vue-next';
 import Card from '@/components/ui/Card.vue';
 import Table, { type Column } from '@/components/ui/Table.vue';
 import Select from '@/components/ui/Select.vue';
@@ -11,15 +11,22 @@ import Badge from '@/components/ui/Badge.vue';
 import Loader from '@/components/ui/Loader.vue';
 import { formatDateShort } from '@/utils/formatDate';
 import { formatAmount } from '@/utils/formatAmount';
+import { fromMinor, sumMinor } from '@/utils/decimal';
 import flowService from '@/services/flowService';
 import reconciliationService from '@/services/reconciliationService';
+import modal from '@/utils/modal';
 import toaster from '@/utils/toaster';
+import { useSidebarStore } from '@/stores/sidebar';
+import { useMatchBasketStore } from '@/stores/matchBasket';
 import type { Flow, ReconciliationEntry } from '@/types';
 import ForceMatchModal from './ForceMatchModal.vue';
 import ExclusionModal from './ExclusionModal.vue';
 import UnexcludeModal from './UnexcludeModal.vue';
+import BasketDrawer from './BasketDrawer.vue';
 
 const route = useRoute();
+const sidebarStore = useSidebarStore();
+const basket = useMatchBasketStore();
 const loading = ref(true);
 const flows = ref<Flow[]>([]);
 const entries = ref<ReconciliationEntry[]>([]);
@@ -105,6 +112,7 @@ const showExclude = ref(false);
 const excludeTarget = ref<ReconciliationEntry | null>(null);
 const showUnexclude = ref(false);
 const unexcludeTarget = ref<ReconciliationEntry | null>(null);
+const showBasket = ref(false);
 
 const flowName = (id: number) => flows.value.find((f) => f.id === id)?.code || `#${id}`;
 const statusVariant = (s: string): 'success' | 'warning' | 'secondary' | 'danger' =>
@@ -128,7 +136,10 @@ const fetchEntries = async () => {
     entries.value = data.items;
     totalCount.value = data.total_count;
     currentOffset.value = batchSize;
+    // The selection is scoped to the current result set on purpose — what has
+    // to survive a new search is the basket, not the ticks.
     selected.value = [];
+    lastClickedId.value = null;
   } catch (e) {
     toaster.error('Failed to load entries');
   } finally {
@@ -157,22 +168,105 @@ const fetchMoreEntries = async () => {
   }
 };
 
+// Pull every remaining batch, so "select all" can cover the whole filtered set
+// and not just the 200 rows already on screen.
+const loadingAll = ref(false);
+const loadAllEntries = async () => {
+  if (loadingAll.value) return;
+  loadingAll.value = true;
+  try {
+    while (entries.value.length < totalCount.value) {
+      const before = entries.value.length;
+      await fetchMoreEntries();
+      if (entries.value.length === before) break; // a failed batch — don't spin
+    }
+  } finally {
+    loadingAll.value = false;
+  }
+};
+const confirmLoadAll = () => {
+  const remaining = totalCount.value - entries.value.length;
+  if (remaining <= 5000) {
+    loadAllEntries();
+    return;
+  }
+  modal.open({
+    title: 'Charger toutes les lignes',
+    message: `${remaining} lignes restent à charger (${Math.ceil(remaining / batchSize)} requêtes). L'affichage peut devenir lent. Continuer ?`,
+    buttons: [
+      { label: 'Annuler', variant: 'secondary', action: () => modal.close() },
+      { label: 'Charger', variant: 'primary', action: () => { modal.close(); loadAllEntries(); } },
+    ],
+  });
+};
+
 // Export all rows matching the current filters (server-side, beyond the loaded
 // batches). Cookie auth (withCredentials) → window.open carries the session.
 const exportExcel = () => {
   window.open(reconciliationService.getExportUrl(filters.value), '_blank');
 };
 
-const toggleSelect = (item: ReconciliationEntry, checked: boolean) => {
-  if (checked) selected.value = [...selected.value, item];
-  else selected.value = selected.value.filter((e) => e.id !== item.id);
+// ── Selection ───────────────────────────────────────────────────────
+// Rows the Table actually shows, after its own search + column filters.
+const visibleItems = ref<ReconciliationEntry[]>([]);
+const onVisibleItems = (rows: Record<string, any>[]) => {
+  visibleItems.value = rows as ReconciliationEntry[];
 };
-const isSelected = (id: number) => selected.value.some((e) => e.id === id);
+// Only pending rows can be forced or excluded.
+const selectableVisible = computed(() => visibleItems.value.filter((i) => i.status === 'pending'));
 
-const selectionTotal = computed(() =>
-  selected.value.reduce((acc, e) => acc + Number(e.amount || 0), 0),
+// A Set, not a scan: isSelected runs once per rendered row, and "Tout charger"
+// can put tens of thousands of rows behind the table's own filters.
+const selectedIds = computed(() => new Set(selected.value.map((e) => e.id)));
+const isSelected = (id: number) => selectedIds.value.has(id);
+
+const setSelected = (rows: ReconciliationEntry[], checked: boolean) => {
+  const byId = new Map(selected.value.map((e) => [e.id, e]));
+  for (const r of rows) {
+    if (checked) byId.set(r.id, r);
+    else byId.delete(r.id);
+  }
+  selected.value = [...byId.values()];
+};
+
+const toggleSelect = (item: ReconciliationEntry, checked: boolean) => setSelected([item], checked);
+
+// Anchor for shift-click range selection.
+const lastClickedId = ref<number | null>(null);
+
+const onRowCheckboxClick = (item: ReconciliationEntry, event: MouseEvent) => {
+  if (item.status !== 'pending') return;
+  const checked = (event.target as HTMLInputElement).checked;
+  if (event.shiftKey && lastClickedId.value !== null && lastClickedId.value !== item.id) {
+    const rows = selectableVisible.value;
+    const from = rows.findIndex((r) => r.id === lastClickedId.value);
+    const to = rows.findIndex((r) => r.id === item.id);
+    if (from !== -1 && to !== -1) {
+      const [a, b] = from <= to ? [from, to] : [to, from];
+      setSelected(rows.slice(a, b + 1), checked);
+      lastClickedId.value = item.id;
+      return;
+    }
+  }
+  toggleSelect(item, checked);
+  lastClickedId.value = item.id;
+};
+
+const allVisibleSelected = computed(
+  () => selectableVisible.value.length > 0 && selectableVisible.value.every((r) => isSelected(r.id)),
 );
-const selectionBalanced = computed(() => Math.abs(selectionTotal.value) < 0.005);
+const someVisibleSelected = computed(() => selectableVisible.value.some((r) => isSelected(r.id)));
+
+const toggleSelectAll = (checked: boolean) => {
+  setSelected(selectableVisible.value, checked);
+  lastClickedId.value = null;
+};
+
+// Exact totals, in minor units — a float tolerance would disagree with the
+// backend's `sum == Decimal("0")` and green-light a group it then rejects.
+const selectionTotalMinor = computed(() => sumMinor(selected.value.map((e) => e.amount)));
+const selectionTotal = computed(() => fromMinor(selectionTotalMinor.value));
+const selectionBalanced = computed(() => selectionTotalMinor.value === 0);
 const selectionConsistent = computed(() => {
   const ccy = new Set(selected.value.map((e) => e.currency));
   return ccy.size <= 1;
@@ -180,6 +274,29 @@ const selectionConsistent = computed(() => {
 const canForceMatch = computed(() =>
   selected.value.length >= 2 && selectionBalanced.value && selectionConsistent.value,
 );
+
+// ── Basket ──────────────────────────────────────────────────────────
+const basketTotal = computed(() => fromMinor(basket.totalMinor));
+
+const addSelectionToBasket = () => {
+  const r = basket.addMany(selected.value);
+  const skipped: string[] = [];
+  if (r.alreadyIn) skipped.push(`${r.alreadyIn} déjà dans le panier`);
+  if (r.otherFlow) skipped.push(`${r.otherFlow} d'un autre flux/devise`);
+  if (r.notPending) skipped.push(`${r.notPending} non « pending »`);
+  if (r.overflow) skipped.push(`${r.overflow} au-delà de la limite du panier`);
+
+  if (r.added === 0) {
+    toaster.warning(skipped.length ? `Aucune ligne ajoutée — ${skipped.join(', ')}` : 'Aucune ligne ajoutée');
+  } else if (skipped.length) {
+    toaster.warning(`${r.added} ligne(s) ajoutée(s) — ignorées : ${skipped.join(', ')}`);
+  } else {
+    toaster.success(`${r.added} ligne(s) ajoutée(s) au panier`);
+  }
+  // Clear so the next search starts from a clean slate — the basket keeps them.
+  selected.value = [];
+  lastClickedId.value = null;
+};
 
 const openExclude = (item: ReconciliationEntry) => {
   excludeTarget.value = item;
@@ -235,6 +352,10 @@ onMounted(async () => {
 <template>
   <div class="flex justify-between items-center mb-6">
     <h1 class="text-2xl font-bold text-space-indigo">Operational view</h1>
+    <Button variant="reveals-secondary" @click="showBasket = true">
+      <ShoppingBasket class="w-4 h-4 inline-block mr-1" />
+      Panier<span v-if="basket.count"> ({{ basket.count }})</span>
+    </Button>
   </div>
 
   <Card class="mb-4">
@@ -273,25 +394,61 @@ onMounted(async () => {
 
   <div v-if="loading" class="flex justify-center py-10"><Loader size="lg" /></div>
 
-  <Card v-else class="pb-20">
+  <Card v-else class="pb-28">
     <div class="flex items-center justify-between mb-2">
       <span class="text-sm text-gray-500">
         Showing {{ entries.length }} of {{ totalCount }} entries
-        <span v-if="loadingMore" class="ml-2 text-turquoise-surf">Loading more...</span>
+        <span v-if="loadingMore || loadingAll" class="ml-2 text-turquoise-surf">Loading more...</span>
+        <button
+          v-else-if="hasMoreToLoad"
+          type="button"
+          class="ml-2 font-medium text-turquoise-surf underline"
+          @click="confirmLoadAll"
+        >
+          Tout charger
+        </button>
       </span>
       <Button variant="reveals-secondary" :disabled="entries.length === 0" @click="exportExcel">
         <Download class="w-4 h-4 inline-block mr-1" /> Export Excel
       </Button>
     </div>
-    <Table :columns="columns" :items="entries" searchable pagination :items-per-page="50" @page-change="onPageChange">
-      <template #cell-select="{ item }">
+    <Table
+      :columns="columns"
+      :items="entries"
+      searchable
+      pagination
+      :items-per-page="50"
+      @page-change="onPageChange"
+      @visible-items="onVisibleItems"
+    >
+      <template #header-select>
         <input
           type="checkbox"
-          :checked="isSelected(item.id)"
-          :disabled="item.status !== 'pending'"
-          @change="(e: any) => item.status === 'pending' && toggleSelect(item, e.target.checked)"
+          :checked="allVisibleSelected"
+          :indeterminate.prop="someVisibleSelected && !allVisibleSelected"
+          :disabled="selectableVisible.length === 0"
+          :title="`Sélectionner les ${selectableVisible.length} ligne(s) pending affichées`"
           class="disabled:opacity-30 disabled:cursor-not-allowed"
+          @click.stop
+          @change="(e: any) => toggleSelectAll(e.target.checked)"
         />
+      </template>
+      <template #cell-select="{ item }">
+        <span class="inline-flex items-center gap-1">
+          <input
+            type="checkbox"
+            :checked="isSelected(item.id)"
+            :disabled="item.status !== 'pending'"
+            title="Maj+clic pour sélectionner une plage"
+            @click="onRowCheckboxClick(item as ReconciliationEntry, $event)"
+            class="disabled:opacity-30 disabled:cursor-not-allowed"
+          />
+          <ShoppingBasket
+            v-if="basket.has(item.id)"
+            class="w-3.5 h-3.5 text-turquoise-surf"
+            aria-label="Déjà dans le panier"
+          />
+        </span>
       </template>
       <template #cell-flow_id="{ item }">{{ flowName(item.flow_id) }}</template>
       <template #cell-value_date="{ item }">{{ formatDateShort(item.value_date) }}</template>
@@ -331,19 +488,52 @@ onMounted(async () => {
     </Table>
   </Card>
 
-  <!-- Sticky action footer -->
+  <!-- Sticky action footer: basket state on top, current selection below -->
   <div
-    v-if="selected.length > 0"
-    class="fixed bottom-0 left-0 right-0 bg-white border-t border-gray-200 shadow-lg p-4 z-40"
-    :style="{ 'margin-left': 'var(--sidebar-width, 0)' }"
+    v-if="basket.count > 0 || selected.length > 0"
+    class="fixed bottom-0 left-0 right-0 bg-white border-t border-gray-200 shadow-lg z-40 transition-all duration-300"
+    :class="sidebarStore.isOpen ? 'ml-64' : 'ml-20'"
   >
-    <div class="max-w-full mx-auto px-4 flex justify-between items-center gap-4">
-      <div class="text-sm font-medium">
-        {{ selected.length }} {{ selected.length === 1 ? 'entry' : 'entries' }} selected
-        <span v-if="selected.length >= 2" class="ml-2 text-gray-600">Σ {{ formatAmount(selectionTotal, selected[0]?.currency) }}</span>
+    <!-- Basket -->
+    <div
+      v-if="basket.count > 0"
+      class="max-w-full mx-auto px-8 py-2.5 flex flex-wrap justify-between items-center gap-4 bg-lavender-blush/40"
+    >
+      <div class="text-sm font-medium text-space-indigo">
+        Panier «&nbsp;{{ basket.active?.name }}&nbsp;» · {{ basket.count }} ligne(s)
+        <span class="ml-2 text-gray-600 tabular-nums">
+          Σ {{ formatAmount(basketTotal, basket.active?.currency) }}
+        </span>
+        <Badge class="ml-2" :variant="basket.isBalanced ? 'success' : 'warning'">
+          {{ basket.isBalanced ? 'Équilibré' : 'Écart' }}
+        </Badge>
+        <span v-if="basket.staleItems.length" class="ml-2 text-xs font-medium text-amber-700">
+          {{ basket.staleItems.length }} ligne(s) périmée(s)
+        </span>
       </div>
       <div class="flex gap-2">
+        <Button variant="secondary" @click="showBasket = true">Voir le panier</Button>
+        <Button variant="secondary" @click="basket.clear()">Vider</Button>
+      </div>
+    </div>
+
+    <!-- Current selection -->
+    <div
+      v-if="selected.length > 0"
+      class="max-w-full mx-auto px-8 py-3 flex flex-wrap justify-between items-center gap-4"
+    >
+      <div class="text-sm font-medium">
+        {{ selected.length }} {{ selected.length === 1 ? 'entry' : 'entries' }} selected
+        <span v-if="selected.length >= 2" class="ml-2 text-gray-600 tabular-nums">Σ {{ formatAmount(selectionTotal, selected[0]?.currency) }}</span>
+      </div>
+      <div class="flex gap-2">
+        <Button variant="reveals-primary" @click="addSelectionToBasket">
+          <ShoppingBasket class="w-4 h-4 inline-block mr-1" /> Ajouter au panier
+        </Button>
+        <!-- Hidden while a basket is open: the basket is then the only authority
+             on what gets forced, so there is never a choice of two Force buttons. -->
         <Button
+          v-if="basket.count === 0"
           variant="reveals-primary"
           action="edit"
           :disabled="!canForceMatch"
@@ -371,4 +561,5 @@ onMounted(async () => {
   <ForceMatchModal v-model="showForce" :entries="selected" @forced="fetchEntries" />
   <ExclusionModal v-model="showExclude" :entry="excludeTarget" :entries="selected.length > 0 && !excludeTarget ? selected : undefined" @excluded="() => { fetchEntries(); selected = []; }" />
   <UnexcludeModal v-model="showUnexclude" :entry="unexcludeTarget" @unexcluded="fetchEntries" />
+  <BasketDrawer v-model="showBasket" :flows="flows" @forced="fetchEntries" />
 </template>

@@ -32,6 +32,7 @@ const fileParserOptions = [
 const finacleParserOptions = [
   { value: 'finacle_db', label: 'Finacle DB extractor' },
   { value: 'finacle_batch_booking_true', label: 'Finacle Batch Booking True' },
+  { value: 'wero', label: 'WERO (datamart)' },
 ];
 
 const fileMatchKeyOptions = [
